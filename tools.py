@@ -22,8 +22,8 @@ def read(path, limit=DEFAULT_LIMIT):
     Returns:
         文件内容字符串；出错时返回错误说明。
     """
-    if os.path.basename(path) == ".env":
-        return "[拒绝] 出于安全考虑，不读取 .env 文件"
+    if os.path.basename(path).startswith(".env"):
+        return "[拒绝] 出于安全考虑，不读取 .env 相关文件（含 .env.local 等变体）"
 
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as f:
