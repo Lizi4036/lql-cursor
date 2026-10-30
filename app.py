@@ -9,6 +9,7 @@
 import json
 import os
 import queue
+import sys
 import threading
 import tkinter as tk
 from tkinter import messagebox
@@ -19,7 +20,21 @@ from openai import OpenAI
 
 from tools import bash, edit, read, write
 
-load_dotenv()
+
+def base_dir():
+    """返回 .env 应该所在的目录。
+
+    - 开发时：app.py 所在目录
+    - 打包成 exe 后：exe 所在目录（不是临时解压目录 _MEIPASS）
+      这样把 .env 放在 exe 旁边即可，无论从哪里启动都能读到。
+    """
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+# 用绝对路径加载，避免依赖"当前工作目录"
+load_dotenv(os.path.join(base_dir(), ".env"))
 
 # ---------------------------------------------------------------- 配置
 
