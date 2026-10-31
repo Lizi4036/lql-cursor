@@ -36,6 +36,20 @@ def base_dir():
 # 用绝对路径加载，避免依赖"当前工作目录"
 load_dotenv(os.path.join(base_dir(), ".env"))
 
+
+def resource_path(name):
+    """查找随程序附带的资源文件（如 icon.ico）。
+
+    依次尝试：exe / 脚本所在目录 → PyInstaller 临时解压目录 _MEIPASS。
+    找不到返回 None，调用方需自行容错。
+    """
+    for folder in (base_dir(), getattr(sys, "_MEIPASS", "")):
+        if folder:
+            path = os.path.join(folder, name)
+            if os.path.exists(path):
+                return path
+    return None
+
 # ---------------------------------------------------------------- 配置
 
 MAX_STEPS = 5          # Agent 最大循环步数
@@ -274,6 +288,7 @@ class AgentApp:
 
     def _build_ui(self):
         self.root.title("极简桌面助手 - AI Agent")
+        self._set_icon()
         self.root.geometry("780x580")
         self.root.minsize(560, 420)
         self.root.configure(bg=BG)
@@ -303,10 +318,25 @@ class AgentApp:
         self.chat.pack(fill="both", expand=True)
         self.chat.configure(state="disabled")
 
-        self.chat.tag_config("user", foreground="#1a73e8",
-                             font=("Microsoft YaHei", 10, "bold"))
-        self.chat.tag_config("tool", foreground="#b8860b")
-        self.chat.tag_config("system", foreground="#999999")
+        # 日志配色：AI 黑色 / 工具蓝色 / 报错红色
+        self.chat.tag_config(
+            "ai", foreground="#2c3e50",
+            font=("Microsoft YaHei", 10),
+        )                                                    # AI 普通回复
+        self.chat.tag_config(
+            "tool", foreground="#0b84ff",
+            font=("Microsoft YaHei", 10, "bold"),
+        )                                                    # 🔧 工具调用
+        self.chat.tag_config(
+            "error", foreground="#e74c3c",
+            font=("Consolas", 10, "bold"),
+        )                                                    # 报错信息
+        self.chat.tag_config(
+            "user", foreground="#1a73e8",
+            font=("Microsoft YaHei", 10, "bold"),
+        )                                                    # 用户输入
+        self.chat.tag_config("result", foreground="#6b7b8c")  # 工具返回结果
+        self.chat.tag_config("system", foreground="#999999")  # 系统提示
 
         self._append(
             "你好，我是极简桌面助手。我可以读文件、改文件、跑命令。\n"
@@ -349,13 +379,40 @@ class AgentApp:
         )
         self.status.pack(fill="x", padx=14, pady=(0, 10))
 
+    def _set_icon(self):
+        """设置窗口图标；图标缺失或加载失败时静默跳过，不影响启动。"""
+        try:
+            path = resource_path("icon.ico")
+            if path:
+                self.root.iconbitmap(path)
+        except Exception:
+            pass
+
     # ---- 输出 ----
 
     def _append(self, text, tag=None):
+        if tag is None:
+            tag = self._guess_tag(text)
         self.chat.configure(state="normal")
         self.chat.insert("end", text + "\n", tag)
         self.chat.see("end")
         self.chat.configure(state="disabled")
+
+    @staticmethod
+    def _guess_tag(text):
+        """按日志内容自动着色：🔧 蓝、报错红、AI 回复黑。"""
+        t = text.strip()
+        if t.startswith("🔧"):
+            return "tool"
+        if "[错误]" in t or "[严重错误]" in t or "[拒绝]" in t:
+            return "error"
+        if t.startswith("你："):
+            return "user"
+        if t.startswith("结果:"):
+            return "result"
+        if t.startswith("——") or t.startswith("["):
+            return "system"
+        return "ai"
 
     def emit(self, text):
         """供工作线程调用：线程安全地投递到界面。"""
