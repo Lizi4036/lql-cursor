@@ -54,6 +54,8 @@ def resource_path(name):
 
 MAX_STEPS = 5          # Agent 最大循环步数
 PREVIEW_LIMIT = 300    # 界面上工具结果的预览长度
+HISTORY_FILE = "history.json"   # 会话历史文件名（存于程序同目录）
+MAX_HISTORY = 50       # 历史消息上限，超出时保留 system + 最近 N 条
 MODEL = os.getenv("OPENAI_MODEL", "deepseek-chat")
 
 # 配色
@@ -173,15 +175,103 @@ def preview(text, limit=PREVIEW_LIMIT):
     return text
 
 
+# ---------------------------------------------------------------- 会话持久化
+
+def history_path():
+    """历史文件路径：始终与程序本体同目录（开发时为脚本目录，打包后为 exe 目录）。"""
+    return os.path.join(base_dir(), HISTORY_FILE)
+
+
+def save_history(messages):
+    """把会话历史写入 history.json。
+
+    序列化要点：
+      - ensure_ascii=False 保证中文正常存储
+      - default=str 兜底，任何 json 无法直接序列化的对象
+        （如 SDK 返回的复杂对象）都退化为字符串，避免写入时抛异常
+    """
+    try:
+        with open(history_path(), "w", encoding="utf-8") as f:
+            json.dump(messages, f, ensure_ascii=False, indent=2, default=str)
+        return True
+    except Exception:
+        return False
+
+
+def load_history():
+    """读取并校验会话历史；任何异常都退化为空列表，绝不让程序启动失败。
+
+    兼容策略（逐层降级）：
+      文件不存在 → []
+      JSON 解析失败 / 编码错误 / IO 错误 → []
+      顶层不是 list → []
+      元素不是 dict、role 非法 → 跳过该条
+      content 不是字符串 → 转字符串（None 转空串）
+    """
+    path = history_path()
+    if not os.path.exists(path):
+        return []
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+        return []
+
+    if not isinstance(data, list):
+        return []
+
+    valid_roles = ("system", "user", "assistant", "tool")
+    result = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        role = item.get("role")
+        if role not in valid_roles:
+            continue
+
+        content = item.get("content")
+        if isinstance(content, str):
+            text = content
+        elif content is None:
+            text = ""
+        else:
+            text = str(content)
+
+        msg = {"role": role, "content": text}
+        if role == "assistant" and isinstance(item.get("tool_calls"), list):
+            msg["tool_calls"] = item["tool_calls"]
+        if role == "tool" and item.get("tool_call_id"):
+            msg["tool_call_id"] = item["tool_call_id"]
+        result.append(msg)
+
+    return result
+
+
+def trim_history(messages, keep=MAX_HISTORY):
+    """就地裁剪历史，避免无限增长撑爆模型上下文窗口。
+
+    保留 system 消息 + 最近的 keep 条对话消息。
+    用切片赋值就地修改，保证调用方持有的引用同步生效。
+    """
+    if len(messages) <= keep:
+        return
+    system = [m for m in messages if m.get("role") == "system"]
+    rest = [m for m in messages if m.get("role") != "system"]
+    messages[:] = system + rest[-(keep - len(system)):]
+
+
 # ---------------------------------------------------------------- Agent 大脑
 
-def run_agent(user_input, emit, stop_event, max_steps=MAX_STEPS):
+def run_agent(user_input, emit, stop_event, messages=None, max_steps=MAX_STEPS):
     """Agent 主循环。
 
     Args:
         user_input: 用户输入
         emit: 回调函数，用于把日志输出到界面
         stop_event: threading.Event，置位后循环会在下一步前退出
+        messages: 会话历史，会**就地追加**本轮消息，调用方据此持久化；
+                  传 None 时内部新建
         max_steps: 最大步数
     """
     api_key = os.getenv("OPENAI_API_KEY")
@@ -191,10 +281,17 @@ def run_agent(user_input, emit, stop_event, max_steps=MAX_STEPS):
 
     client = OpenAI(api_key=api_key, base_url=os.getenv("OPENAI_BASE_URL"))
 
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": user_input},
-    ]
+    if messages is None:
+        messages = []
+
+    # 保证 system prompt 存在且位于最前（兼容历史文件里没有 system 的情况）
+    if not any(m.get("role") == "system" for m in messages):
+        messages.insert(0, {"role": "system", "content": SYSTEM_PROMPT})
+
+    # 历史过长时裁剪，避免超出模型上下文窗口
+    trim_history(messages)
+
+    messages.append({"role": "user", "content": user_input})
 
     for step in range(1, max_steps + 1):
         # 中断检查点 1：每步开始前
@@ -280,8 +377,10 @@ class AgentApp:
         self.msg_queue = queue.Queue()
         self.stop_event = threading.Event()
         self.worker = None
+        self.messages = load_history()
 
         self._build_ui()
+        self._render_history()
         self.root.after(100, self._poll_queue)
 
     # ---- 界面搭建 ----
@@ -379,6 +478,28 @@ class AgentApp:
         )
         self.status.pack(fill="x", padx=14, pady=(0, 10))
 
+    def _render_history(self):
+        """把已保存的历史渲染到界面（system 消息不展示）。"""
+        shown = [m for m in self.messages if m.get("role") != "system"]
+        if not shown:
+            return
+
+        self._append(f"—— 已加载 {len(shown)} 条历史记录 ——", "system")
+        for m in shown:
+            role = m["role"]
+            content = m.get("content") or ""
+            if role == "user":
+                self._append(f"你：{content}", "user")
+            elif role == "assistant":
+                if content:
+                    self._append(content, "ai")
+                for call in m.get("tool_calls") or []:
+                    fn = (call.get("function") or {}).get("name", "?")
+                    self._append(f"🔧 正在调用工具：{fn}", "tool")
+            elif role == "tool":
+                self._append(f"   结果: {preview(content)}", "result")
+        self._append("—— 以上为历史记录 ——", "system")
+
     def _set_icon(self):
         """设置窗口图标；图标缺失或加载失败时静默跳过，不影响启动。"""
         try:
@@ -460,10 +581,17 @@ class AgentApp:
 
     def _work(self, text):
         try:
-            run_agent(text, self.emit, self.stop_event)
+            run_agent(text, self.emit, self.stop_event, self.messages)
         except Exception as e:  # 兜底，保证界面一定能恢复
             self.emit(f"[严重错误] {type(e).__name__}: {e}")
         finally:
+            # 无论正常结束、被中断还是异常，都把会话落盘
+            ok = save_history(self.messages)
+            self.emit(
+                "[系统] 会话已保存到 history.json"
+                if ok
+                else "[警告] 会话保存失败"
+            )
             self.msg_queue.put("__DONE__")
 
     def _on_finished(self):
