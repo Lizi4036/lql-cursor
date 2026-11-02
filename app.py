@@ -357,6 +357,18 @@ def run_agent(user_input, emit, stop_event, messages=None, max_steps=MAX_STEPS):
             result = execute_tool(name, arguments)
             emit(f"   结果: {preview(result)}")
 
+            # edit 成功后追加 Diff 预览：红=删除，绿=新增。
+            # 由于 edit 保证只替换一处，old_str/new_str 就是精确的删/增内容，
+            # 无需读文件对比，也不会把 diff 发给模型（只走界面显示）。
+            if name == "edit" and str(result).startswith("[成功]"):
+                old = str(arguments.get("old_str", ""))
+                new = str(arguments.get("new_str", ""))
+                emit("   ── 修改预览 ──", "system")
+                for line in (old.splitlines() or [""]):
+                    emit("   - " + line, "del")
+                for line in (new.splitlines() or [""]):
+                    emit("   + " + line, "add")
+
             messages.append(
                 {
                     "role": "tool",
@@ -436,6 +448,8 @@ class AgentApp:
         )                                                    # 用户输入
         self.chat.tag_config("result", foreground="#6b7b8c")  # 工具返回结果
         self.chat.tag_config("system", foreground="#999999")  # 系统提示
+        self.chat.tag_config("del", foreground="#c0392b")     # Diff：删除行（红）
+        self.chat.tag_config("add", foreground="#1e8449")     # Diff：新增行（绿）
 
         self._append(
             "你好，我是极简桌面助手。我可以读文件、改文件、跑命令。\n"
@@ -471,12 +485,21 @@ class AgentApp:
         )
         self.stop_btn.pack(side="left", padx=(8, 0), ipady=5)
 
-        # 状态栏
+        # 状态栏（左：状态文字；右：清空历史按钮）
+        status_bar = tk.Frame(self.root, bg=BG)
+        status_bar.pack(fill="x", padx=14, pady=(0, 10))
         self.status = tk.Label(
-            self.root, text="就绪", anchor="w", bg=BG, fg="#7f8c8d",
+            status_bar, text="就绪", anchor="w", bg=BG, fg="#7f8c8d",
             font=("Microsoft YaHei", 9),
         )
-        self.status.pack(fill="x", padx=14, pady=(0, 10))
+        self.status.pack(side="left")
+        self.clear_btn = tk.Button(
+            status_bar, text="清空历史", command=self.on_clear_history,
+            bg="#95a5a6", fg="white", activebackground="#7f8c8d",
+            activeforeground="white", relief="flat",
+            font=("Microsoft YaHei", 9), padx=10,
+        )
+        self.clear_btn.pack(side="right")
 
     def _render_history(self):
         """把已保存的历史渲染到界面（system 消息不展示）。"""
@@ -535,9 +558,14 @@ class AgentApp:
             return "system"
         return "ai"
 
-    def emit(self, text):
-        """供工作线程调用：线程安全地投递到界面。"""
-        self.msg_queue.put(text)
+    def emit(self, text, tag=None):
+        """供工作线程调用：线程安全地投递到界面。
+
+        tag 为 None 时按内容自动着色；
+        显式指定 tag（如 "del" / "add"）时直接使用，供 Diff 预览等场景。
+        队列统一放 (text, tag) 元组，_poll_queue 负责解包。
+        """
+        self.msg_queue.put((text, tag))
 
     def _poll_queue(self):
         """主线程定时取队列，避免跨线程直接操作 tkinter。"""
@@ -546,6 +574,8 @@ class AgentApp:
                 item = self.msg_queue.get_nowait()
                 if item == "__DONE__":
                     self._on_finished()
+                elif isinstance(item, tuple):
+                    self._append(item[0], item[1])
                 else:
                     self._append(item)
         except queue.Empty:
@@ -578,6 +608,37 @@ class AgentApp:
             self.status.configure(text="正在中断，等待当前步骤结束...")
             self._append("[用户] 已请求中断。", "system")
         self.stop_btn.configure(state="disabled")
+
+    def on_clear_history(self):
+        """清空界面显示并删除本地 history.json。"""
+        # 任务运行中禁止清空：工作线程正持有 self.messages 并会在
+        # 结束时把它写回文件，此时清空会被旧数据覆盖，还会引发数据竞争
+        if self.worker and self.worker.is_alive():
+            self._append("[系统] 任务正在运行，请先点【中断】再清空历史。", "system")
+            return
+
+        if not messagebox.askyesno(
+            "清空历史",
+            "将删除全部聊天记录（含本地 history.json 文件），确定吗？\n此操作不可恢复。",
+        ):
+            return
+
+        # 1) 清空内存中的会话
+        self.messages = []
+        # 2) 删除本地文件（不存在时静默跳过）
+        try:
+            if os.path.exists(history_path()):
+                os.remove(history_path())
+        except OSError as e:
+            self._append(f"[警告] 删除 history.json 失败: {e}", "system")
+            return
+        # 3) 清空聊天框显示
+        self.chat.configure(state="normal")
+        self.chat.delete("1.0", "end")
+        self.chat.configure(state="disabled")
+
+        self._append("历史已清空。有什么新任务，随时告诉我。", "system")
+        self.status.configure(text="已清空历史")
 
     def _work(self, text):
         try:
