@@ -65,7 +65,40 @@
 
 - Agent 跑在独立线程，界面**永不卡死**
 - 红色【■ 中断】按钮通过 `threading.Event` 控制，在每一步、每个工具执行前检查中断信号
-- 日志按类型着色：**AI 回复黑色、工具调用蓝色、报错信息红色**
+- 日志按类型着色：**AI 回复浅色、工具调用蓝色、报错信息红色、Diff 红删绿增**
+
+### 5. 支持 MCP 动态扩展
+
+工具不是硬编码的。程序启动时以 **MCP Client** 身份拉起一个独立的
+MCP Server 子进程，自动发现它提供的工具，并动态注册给大模型：
+
+```
+app.py（Client）  ──stdio / JSON-RPC──►  mcp_server.py（Server）
+                                              ├─ get_current_time(city)
+                                              └─ add_numbers(a, b)
+```
+
+- **零代码扩展**：换一个 Server 就多一批能力，主程序无需改动
+- **进程隔离**：Server 是独立子进程，崩溃不会拖垮主程序
+- **优雅降级**：连不上就只用本地 4 个工具，界面明确提示，绝不阻塞启动
+- **日志纪律**：Server 端所有日志强制走 `stderr`，杜绝 `print()` 污染 JSON-RPC 协议流
+
+启动后界面会显示：
+
+```
+⏳ 正在连接 MCP Server ...
+[MCP] 已连接「time-server」，新增工具: get_current_time, add_numbers
+[MCP] 当前共 6 个工具可用
+```
+
+依赖安装：
+
+```powershell
+py -m pip install mcp -i https://pypi.tuna.tsinghua.edu.cn/simple
+```
+
+> 注：打包成 exe 后，MCP 需要目标机器装有 Python 与 mcp 库，
+> 并把 `mcp_server.py` 放在 exe 同级目录；否则自动降级为纯本地模式。
 
 ---
 

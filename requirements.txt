@@ -1,3 +1,4 @@
 openai==3.41.0
 python-dotenv==1.2.4
 sv-ttk==2.6.1
+mcp==2.3.0

@@ -61,6 +61,7 @@
 | F6 | 图形界面展示对话与工具日志 | ✅ tkinter + ScrolledText |
 | F7 | 随时中断 Agent 执行 | ✅ `threading.Event` + 红色按钮 |
 | F8 | 从 `.env` 读取配置 | ✅ `python-dotenv` |
+| F9 | 通过 MCP 动态扩展外部工具 | ✅ MCP Client + `mcp_server.py`（+2 工具） |
 
 ### 2.2 非功能性需求
 
@@ -340,6 +341,213 @@ def _guess_tag(text):
 
 日志到达时自动判断类型并着色，无需改动 `emit()` 接口，实现展示层与逻辑层解耦。
 
+### 4.7 接入 MCP：跨进程、跨异步范式的工具扩展
+
+#### （1）为什么要接 MCP
+
+前面四个工具是硬编码在程序里的。每加一个能力（查天气、查数据库），
+都要改 `TOOLS` 数组、改 `TOOL_MAP`、改 `execute_tool`——工具和主程序死死耦合。
+
+MCP（Model Context Protocol）把这件事标准化了：
+
+- **Server**：独立进程，用统一协议暴露自己的工具
+- **Client**：Agent 主程序，启动时问 Server「你有哪些工具」，运行时把调用转发过去
+
+好处是**工具可插拔**：主程序一行不改，换一个 Server 就多一批能力。
+
+```
+┌──────────────────────────┐         ┌──────────────────────┐
+│  app.py（MCP Client）     │  stdio  │  mcp_server.py        │
+│  Agent 循环 + tkinter     │◄───────►│  get_current_time     │
+│  动态发现并转发调用        │ JSON-RPC│  add_numbers          │
+└──────────────────────────┘  子进程  └──────────────────────┘
+```
+
+#### （2）stdio 通道为什么绝对不能用 `print`
+
+这是接入 MCP 最容易踩、也最致命的坑。
+
+stdio 传输下，Client 与 Server 靠**标准输入输出**通信，
+协议是 JSON-RPC over stdio，约定为：**一行一条 JSON 消息**。
+
+```
+Client ──stdin──►  Server
+Client ◄─stdout──  Server
+Server ──stderr──► 日志（不参与协议，安全）
+```
+
+关键在于 **stdout 是协议专用通道，不是给人看的终端**。
+
+一旦写了 `print("收到调用")`，stdout 上就多出一行纯文本：
+
+```
+{"jsonrpc":"2.0","id":1,"method":"tools/list"}     ← 正常协议消息
+收到调用                                            ← print 污染
+{"jsonrpc":"2.0","id":1,"result":{...}}            ← 正常协议消息
+```
+
+Client 读到「收到调用」后尝试 `json.loads` → 抛 `JSONDecodeError`
+→ 会话判定异常 → **连接直接断开**。而且报错信息往往指向别处，极难排查。
+
+正确做法：所有日志走 stderr。
+
+```python
+logging.basicConfig(
+    level=logging.INFO,
+    stream=sys.stderr,          # 关键：不是 stdout
+    format="[mcp-server] %(levelname)s: %(message)s",
+)
+logger = logging.getLogger("mcp_server")
+
+@server.tool()
+def get_current_time(city: str = "北京") -> str:
+    logger.info("收到调用 get_current_time(city=%r)", city)   # 安全
+```
+
+同理还有两条纪律：
+
+| 禁止 | 原因 |
+|:---|:---|
+| `print(...)` | 污染 stdout 的 JSON-RPC 流，直接断连 |
+| `input()` / `sys.stdin.read()` | 抢读 stdin，与协议读循环冲突 |
+| 工具函数内 `sys.stdout.write` | 同上，任何写 stdout 都危险 |
+
+本项目 `mcp_server.py` 全文**不存在一个 `print`**，这是刻意遵守的约束。
+
+#### （3）异步 SDK 与同步 GUI 的桥接
+
+MCP 官方 Python SDK 是 asyncio 的：
+
+```python
+async with stdio_client(params) as (read, write):
+    async with ClientSession(read, write) as session:
+        await session.initialize()
+        tools = await session.list_tools()
+```
+
+而 app.py 是同步的 tkinter 程序，两种范式直接混用会出问题。
+
+**方案 A（错误）：每次调用都 `asyncio.run()`**
+
+```python
+def call_tool(name, args):
+    return asyncio.run(_do_call(name, args))   # 每次都新建事件循环
+```
+
+问题：`stdio_client` 每进一次就要**启动一个子进程**。
+一次对话调三次工具 = 起三次 Python 进程，每次 1 秒以上，体验极差。
+
+**方案 B（错误）：手动 `__aenter__` / `__aexit__`**
+
+```python
+read, write = await cm.__aenter__()   # 在 task A 里进入
+...
+await cm.__aexit__(None, None, None)  # 在 task B 里退出  ← 报错
+```
+
+`stdio_client` 内部使用 anyio 的 task group，
+进入与退出**必须在同一个 task**，否则抛：
+
+```
+RuntimeError: Attempted to exit cancel scope in a different task
+```
+
+**方案 C（本项目采用）：后台线程 + 长驻协程**
+
+```python
+# 后台线程跑独立事件循环
+def _thread_main(self):
+    self.loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(self.loop)
+    self.loop.run_until_complete(self._serve())     # 只跑一次，不退出
+
+async def _serve(self):
+    async with stdio_client(params) as (read, write):      # ← 整个生命周期
+        async with ClientSession(read, write) as session:  #   都在同一个 task 内
+            await session.initialize()
+            result = await session.list_tools()
+            self._tools = [...]
+            self._ready.set()                # 通知主线程：工具列表已拿到
+            await self._shutdown.wait()      # 挂起，保持连接存活
+```
+
+三个要点：
+
+1. **`async with` 完整包住生命周期**，进入和退出天然在同一 task，规避 anyio 限制
+2. **`await self._shutdown.wait()` 让协程长期挂起**，连接不关闭、子进程不退出
+3. 主线程用 `run_coroutine_threadsafe` 把协程投进该 loop，再同步等结果：
+
+```python
+def call_tool(self, name, arguments=None, timeout=30.0):
+    future = asyncio.run_coroutine_threadsafe(
+        self.session.call_tool(name, arguments or {}), self.loop
+    )
+    result = future.result(timeout)      # 主线程同步等待
+    return self._content_text(result)
+```
+
+对 `execute_tool()` 而言，MCP 工具和本地 `bash()` 没有任何区别——
+都是「传参、返回字符串」，**异步被完整封装在 Client 内部**。
+
+#### （4）动态发现与优雅降级
+
+启动流程：
+
+```
+GUI 就绪
+  └─ 后台线程连接 Server（不阻塞界面，最多等 25s）
+       ├─ 成功 → list_tools() → 转 OpenAI Schema → TOOLS.extend()
+       │         界面提示：已连接「time-server」，新增工具: get_current_time, add_numbers
+       └─ 失败 → 只记一条日志，本地 4 个工具照常工作
+```
+
+MCP 的 `input_schema` 与 OpenAI 的 `parameters` 结构本就一致，套一层外壳即可：
+
+```python
+{"type": "function",
+ "function": {"name": t["name"],
+              "description": t["description"],
+              "parameters": t["input_schema"]}}
+```
+
+**降级是硬要求**：MCP 只是加分项，它的任何故障都不能让主程序起不来。
+因此整条链路有三层保护：
+
+| 层级 | 保护手段 |
+|:---|:---|
+| import | `try: import mcp_client / except ImportError: mcp_module = None` |
+| 连接 | `client.start()` 返回 False 即放弃，`MCP_CLIENT` 保持 None |
+| 调用 | `call_tool()` 内部捕获全部异常，返回 `[错误] ...` 字符串 |
+
+#### （5）MCP 2.x 的 API 变更（实操踩坑）
+
+官方在 2.x 大面积改名，网上绝大多数教程仍停留在 1.x：
+
+| 1.x 写法（教程常见） | 2.x 实际 |
+|:---|:---|
+| `from mcp.server.fastmcp import FastMCP` | `from mcp.server.mcpserver import MCPServer` |
+| `result.isError` | `result.is_error` |
+| `tool.inputSchema` | `tool.input_schema` |
+| `info.serverInfo` | `info.server_info` |
+
+照抄旧教程会直接 `ImportError` 或 `AttributeError`。
+本项目在动笔前先打印类的签名做确认，避免了返工。
+
+#### （6）打包后的限制
+
+PyInstaller 打包后 `sys.executable` 指向 **exe 本身**，不再是 Python 解释器，
+无法用它启动 `mcp_server.py`。因此做了区分：
+
+```python
+if not getattr(sys, "frozen", False):
+    return sys.executable          # 开发时：当前解释器
+for name in ("python", "python3", "py"):
+    found = shutil.which(name)     # 打包后：去 PATH 找系统 Python
+```
+
+找不到就返回 None，MCP 自动降级。这也意味着**打包版的 MCP 需要目标机器
+装有 Python 与 mcp 库**，并把 `mcp_server.py` 放在 exe 同级目录。
+
 ---
 
 ## 五、测试验证
@@ -405,6 +613,24 @@ def _guess_tag(text):
 25 项测试全部通过，功能需求 F1–F8 全部达成，
 非功能性需求中的安全性与可靠性约束均通过机制而非约定得到保证。
 
+### 5.4 MCP 专项测试
+
+| 用例 | 预期 | 结果 |
+|:---|:---|:---:|
+| Server 独立连接 | 握手成功，返回 server 名 `time-server` | ✅ |
+| 工具发现 | 返回 `get_current_time`、`add_numbers` 两个工具 | ✅ |
+| `get_current_time(北京)` | 返回 `... (UTC+8) 北京` | ✅ |
+| `get_current_time(东京)` | 返回 `... (UTC+9) 东京` | ✅ |
+| 未收录城市（火星） | 回退 UTC 并明确说明未收录 | ✅ |
+| `add_numbers(3, 4)` | 返回 `3.0 + 4.0 = 7.0` | ✅ |
+| 调用不存在的工具 | 返回 `[错误] MCP 工具返回错误: Unknown tool` | ✅ |
+| Agent 侧集成 | `TOOLS` 由 4 个动态扩展为 6 个 | ✅ |
+| Schema 可序列化 | 全部工具 Schema 通过 `json.dumps` | ✅ |
+| 转发执行 | `execute_tool("get_current_time")` 正确取回时间 | ✅ |
+| 降级保护 | Server 脚本缺失时 `start()` 返回 False，主程序照常可用 | ✅ |
+| 原有功能回归 | 4 个本地工具 / 中断 / 清空历史 / Diff 全部正常 | ✅ |
+| 关闭清理 | 关窗后 MCP 子进程不残留 | ✅ |
+
 ---
 
 ## 六、创新亮点
@@ -436,6 +662,23 @@ Agent 跑在独立线程，通过 `queue.Queue` 与界面单向通信，
 
 工具结果完整送回模型保证决策准确，界面只显示前 300 字符保证可读性——
 同一份数据在两个消费端采用不同的呈现策略。
+
+### 6.6 把"看不见的故障"提前设计掉
+
+MCP 的 stdio 通道有个反直觉的约束：**日志写错地方就会断连**。
+`print()` 在普通程序里是调试刚需，在 MCP Server 里却是致命错误——
+它污染的是 JSON-RPC 协议流，而不是给人看的终端，
+且断连时的报错信息往往指向别处，排查成本极高。
+
+同理，异步 SDK 与同步 GUI 的混用也有个隐蔽陷阱：
+手动 `__aenter__`/`__aexit__` 会触发 anyio 的
+`cancel scope in a different task`，错误信息与真实原因相距甚远。
+
+本项目对这两类问题采取的策略是**先建立约束，再写业务代码**：
+
+- Server 端立下「全文零 `print`、日志只走 stderr」的硬纪律
+- Client 端用「后台线程 + 长驻协程 + `run_coroutine_threadsafe`」一次性解决范式冲突
+- 整条 MCP 链路三层降级，任何故障都不影响主程序
 
 ---
 
@@ -505,6 +748,7 @@ load_dotenv(os.path.join(base_dir(), ".env"))
 - 实现最多 5 步的 Agent 自主循环，工具调用过程完全透明
 - 实现 tkinter 图形界面，多线程不卡死，支持一键中断
 - 建立三层安全机制：密钥不入库、配置文件不可读、危险命令不执行
+- 接入 MCP 协议，实现工具的动态发现与跨进程调用，工具数由 4 个扩展到 6 个
 - 编写 25 项单元测试并全部通过
 - 支持 PyInstaller 打包为单文件 exe 分发
 
@@ -515,6 +759,7 @@ load_dotenv(os.path.join(base_dir(), ".env"))
 
 | 不足 | 说明 |
 |:---|:---|
+| 打包版 MCP 受限 | exe 无法作为解释器启动脚本，需目标机装有 Python 与 mcp 库 |
 | 中断非强制 | `threading.Event` 只能在步骤之间生效，API 请求或命令执行期间需等待 |
 | 黑名单可被绕过 | 字符串匹配挡不住变量拼接（如 `RM="rm -rf /"; $RM`），真正隔离需容器沙箱 |
 | 无会话持久化 | 关闭窗口后对话历史丢失 |

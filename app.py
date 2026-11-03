@@ -22,6 +22,14 @@ try:                    # 主题库缺失时自动降级为默认样式，不影
 except ImportError:
     sv_ttk = None
 
+try:                    # MCP 依赖缺失时仅关闭 MCP 功能，其余照常运行
+    import mcp_client as mcp_module
+except ImportError:
+    mcp_module = None
+
+# 全局 MCP 客户端；None 表示未启用或连接失败（此时只有本地 4 个工具）
+MCP_CLIENT = None
+
 from tools import bash, edit, read, write
 
 
@@ -164,9 +172,15 @@ TOOL_MAP = {"read": read, "write": write, "edit": edit, "bash": bash}
 # ---------------------------------------------------------------- 工具执行
 
 def execute_tool(name, arguments):
-    """执行工具，任何异常都转成字符串返回，绝不抛给调用方。"""
+    """执行工具，任何异常都转成字符串返回，绝不抛给调用方。
+
+    本地工具优先；本地没有的，转发给 MCP Server（若已连接）。
+    """
     func = TOOL_MAP.get(name)
     if func is None:
+        # 不是本地工具，尝试交给 MCP
+        if MCP_CLIENT is not None and name in MCP_CLIENT.tool_names:
+            return MCP_CLIENT.call_tool(name, arguments)
         return f"[错误] 未知工具: {name}"
     try:
         return func(**arguments)
@@ -404,6 +418,11 @@ class AgentApp:
         self._render_history()
         self.root.after(100, self._poll_queue)
 
+        # 关窗时清理 MCP 子进程
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        # 后台连接 MCP Server（不阻塞界面）
+        self.init_mcp()
+
     # ---- 界面搭建 ----
 
     def _build_ui(self):
@@ -523,6 +542,49 @@ class AgentApp:
             elif role == "tool":
                 self._append(f"   结果: {preview(content)}", "result")
         self._append("—— 以上为历史记录 ——", "system")
+
+    def init_mcp(self):
+        """后台连接 MCP Server，成功后把它的工具追加进 TOOLS。
+
+        全程非阻塞：连接在后台线程进行，界面不受影响；
+        即使失败，也只是少一个加分工具，本地 4 个工具照常工作。
+        """
+        if mcp_module is None:
+            self.emit(
+                "[MCP] 未检测到 mcp 库，已跳过（安装: py -m pip install mcp）",
+                "system",
+            )
+            return
+
+        self.emit("⏳ 正在连接 MCP Server ...", "system")
+
+        def _run():
+            global MCP_CLIENT
+            client = mcp_module.MCPClient()
+            if client.start():
+                MCP_CLIENT = client
+                TOOLS.extend(client.openai_tools())
+                self.emit(
+                    f"[MCP] 已连接「{client.server_name}」，"
+                    f"新增工具: {', '.join(client.tool_names)}",
+                    "tool",
+                )
+                self.emit(f"[MCP] 当前共 {len(TOOLS)} 个工具可用", "system")
+            else:
+                self.emit(
+                    f"[MCP] 连接失败：{client.error}（继续使用本地工具）", "error"
+                )
+
+        threading.Thread(target=_run, name="mcp-init", daemon=True).start()
+
+    def _on_close(self):
+        """关闭窗口前先收掉 MCP 子进程，避免进程残留。"""
+        if MCP_CLIENT is not None:
+            try:
+                MCP_CLIENT.stop(timeout=2)
+            except Exception:
+                pass
+        self.root.destroy()
 
     def _set_icon(self):
         """设置窗口图标；图标缺失或加载失败时静默跳过，不影响启动。"""
