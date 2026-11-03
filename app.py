@@ -68,6 +68,11 @@ MAX_STEPS = 5          # Agent 最大循环步数
 PREVIEW_LIMIT = 300    # 界面上工具结果的预览长度
 HISTORY_FILE = "history.json"   # 会话历史文件名（存于程序同目录）
 MAX_HISTORY = 50       # 历史消息上限，超出时保留 system + 最近 N 条
+PREVIEW_FILE_LIMIT = 20000   # 中栏预览单文件的最大字符数
+TREE_MAX_DEPTH = 4           # 文件树展开深度上限
+TREE_MAX_NODES = 800         # 文件树节点总数上限（防止大目录卡死界面）
+TREE_IGNORE = {".git", "__pycache__", "dist", "build", "node_modules",
+               "venv", ".venv", ".idea", ".vscode", ".mypy_cache"}
 MODEL = os.getenv("OPENAI_MODEL", "deepseek-chat")
 
 # 配色：Sun Valley 深色（Win11 风格）
@@ -417,6 +422,8 @@ class AgentApp:
         self._build_ui()
         self._render_history()
         self.root.after(100, self._poll_queue)
+        # 定时检测预览文件是否被改动，Agent 改完文件中栏会自动刷新（纯 UI 层，不碰后端）
+        self.root.after(1500, self._watch_preview)
 
         # 关窗时清理 MCP 子进程
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -426,26 +433,218 @@ class AgentApp:
     # ---- 界面搭建 ----
 
     def _build_ui(self):
+        """三栏 IDE 风格布局：左文件树 / 中预览 / 右对话。
+
+        仅重建界面结构。控件名（chat / entry / send_btn / stop_btn /
+        clear_btn / status）全部保持不变，后端逻辑零改动即可继续工作。
+        """
         self.root.title("极简桌面助手 - AI Agent")
         self._set_icon()
-        self.root.geometry("840x640")
-        self.root.minsize(620, 480)
+        self.root.geometry("1200x720")
+        self.root.minsize(900, 560)
         self.root.configure(bg=BG)
 
-        # ---- 标题栏：用 ttk 容器，背景跟随主题，避免色差断层
-        header = ttk.Frame(self.root, padding=(20, 14, 20, 10))
+        # ---- 顶部标题栏：横跨三栏
+        header = ttk.Frame(self.root, padding=(18, 12, 18, 6))
         header.pack(fill="x")
         ttk.Label(
-            header, text="极简桌面助手",
-            font=(UI_FONT, 16, "bold"),
+            header, text="极简桌面助手", font=(UI_FONT, 15, "bold"),
         ).pack(side="left")
         ttk.Label(
-            header, text=f"{MODEL}  ｜  read / write / edit / bash",
+            header, text=f"{MODEL}  ｜  read / write / edit / bash + MCP",
             font=(UI_FONT, 9), foreground=FG_MUTED,
         ).pack(side="right")
 
-        # ---- 聊天区：ttk 没有 ScrolledText，用 Text + ttk.Scrollbar 组合
-        chat_frame = ttk.Frame(self.root, padding=(16, 2, 16, 0))
+        # ---- 三栏容器：分隔线可拖动，自由调整三栏宽度
+        self.paned = ttk.PanedWindow(self.root, orient="horizontal")
+        self.paned.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+
+        left = ttk.Frame(self.paned)
+        middle = ttk.Frame(self.paned)
+        right = ttk.Frame(self.paned)
+        self.paned.add(left, weight=0)      # 文件树：不抢多余宽度
+        self.paned.add(middle, weight=1)
+        self.paned.add(right, weight=1)
+
+        self._build_file_panel(left)
+        self._build_preview_panel(middle)
+        self._build_chat_panel(right)
+
+        # 等窗口真正渲染后再设置分隔线初始位置
+        self.root.after(150, self._set_initial_sashes)
+
+    def _panel_header(self, parent, text):
+        """各栏统一的分区标题（标题 + 细分隔线），让整体更像 IDE。"""
+        bar = ttk.Frame(parent, padding=(14, 10, 14, 6))
+        bar.pack(fill="x")
+        ttk.Label(
+            bar, text=text, font=(UI_FONT, 9, "bold"), foreground=FG_MUTED,
+        ).pack(side="left")
+        ttk.Separator(parent, orient="horizontal").pack(fill="x", padx=10)
+
+    # ---- 左栏：文件树
+
+    def _build_file_panel(self, parent):
+        self._panel_header(parent, "资源管理器")
+
+        body = ttk.Frame(parent, padding=(10, 8, 8, 10))
+        body.pack(fill="both", expand=True)
+
+        self.tree = ttk.Treeview(body, show="tree", selectmode="browse")
+        vbar = ttk.Scrollbar(body, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=vbar.set)
+        vbar.pack(side="right", fill="y")
+        self.tree.pack(side="left", fill="both", expand=True)
+
+        ttk.Style().configure("Treeview", font=(UI_FONT, 10), rowheight=26)
+
+        self.tree.bind("<<TreeviewSelect>>", self._on_tree_select)
+
+        # 节点 id -> 真实路径
+        self._tree_paths = {}
+        self._node_count = 0
+
+        root_dir = base_dir()
+        root_node = self.tree.insert(
+            "", "end", text=os.path.basename(root_dir) or root_dir, open=True,
+        )
+        self._tree_paths[root_node] = root_dir
+        self._populate_tree(root_node, root_dir)
+
+    def _populate_tree(self, parent, path, depth=0):
+        """递归填充文件树；深度与节点数均有上限，避免大目录卡死界面。"""
+        if depth >= TREE_MAX_DEPTH or self._node_count >= TREE_MAX_NODES:
+            return
+
+        try:
+            entries = sorted(
+                os.scandir(path),
+                key=lambda e: (not e.is_dir(follow_symlinks=False), e.name.lower()),
+            )
+        except OSError:
+            return
+
+        for entry in entries:
+            if self._node_count >= TREE_MAX_NODES:
+                return
+            try:
+                is_dir = entry.is_dir(follow_symlinks=False)
+            except OSError:
+                continue
+
+            if is_dir:
+                if entry.name in TREE_IGNORE:
+                    continue
+            elif entry.name in ("Thumbs.db", "desktop.ini"):
+                continue
+
+            node = self.tree.insert(parent, "end", text=entry.name)
+            self._tree_paths[node] = entry.path
+            self._node_count += 1
+            if is_dir:
+                self._populate_tree(node, entry.path, depth + 1)
+
+    def _on_tree_select(self, _event=None):
+        """单击树节点：是文件就在中栏预览，目录则忽略。"""
+        selection = self.tree.selection()
+        if not selection:
+            return
+        path = self._tree_paths.get(selection[0])
+        if not path or os.path.isdir(path):
+            return
+        self._load_preview(path)
+
+    # ---- 中栏：文件预览
+
+    def _build_preview_panel(self, parent):
+        bar = ttk.Frame(parent, padding=(14, 10, 14, 6))
+        bar.pack(fill="x")
+        self.preview_title = ttk.Label(
+            bar, text="文件预览", font=(UI_FONT, 9, "bold"), foreground=FG_MUTED,
+        )
+        self.preview_title.pack(side="left")
+        ttk.Separator(parent, orient="horizontal").pack(fill="x", padx=10)
+
+        body = ttk.Frame(parent, padding=(10, 8, 8, 10))
+        body.pack(fill="both", expand=True)
+
+        self.preview = tk.Text(
+            body, wrap="none", font=(CODE_FONT, 10),
+            bg=SURFACE, fg=FG, insertbackground=FG,
+            relief="flat", bd=0, highlightthickness=1,
+            highlightbackground=BORDER, highlightcolor=BORDER,
+            padx=14, pady=12, spacing1=2, spacing3=2,
+            selectbackground="#3a5a78", selectforeground="#ffffff",
+        )
+        vbar = ttk.Scrollbar(body, orient="vertical", command=self.preview.yview)
+        hbar = ttk.Scrollbar(body, orient="horizontal", command=self.preview.xview)
+        self.preview.configure(yscrollcommand=vbar.set, xscrollcommand=hbar.set)
+        vbar.pack(side="right", fill="y")
+        hbar.pack(side="bottom", fill="x")
+        self.preview.pack(side="left", fill="both", expand=True)
+        self.preview.configure(state="disabled")
+
+        self.preview.tag_config("hint", foreground="#6f6f6f", font=(UI_FONT, 10))
+
+        self.current_file = None      # 当前预览的文件路径
+        self._preview_mtime = None    # 读取时的修改时间，用于自动刷新
+        self._show_preview_hint()
+
+    def _show_preview_hint(self):
+        self.preview.configure(state="normal")
+        self.preview.delete("1.0", "end")
+        self.preview.insert(
+            "1.0",
+            "← 从左侧选择一个文件，内容会显示在这里。\n\n"
+            "Agent 修改文件后，这里会自动刷新。",
+            "hint",
+        )
+        self.preview.configure(state="disabled")
+
+    def _load_preview(self, path):
+        """读取并展示文件内容（只读）。
+
+        复用 tools.read()：自动继承 .env 拦截与统一错误提示，
+        避免中栏成为绕过安全策略的旁路。
+        """
+        try:
+            self._preview_mtime = os.path.getmtime(path)
+        except OSError:
+            self._preview_mtime = None
+
+        content = read(path, limit=PREVIEW_FILE_LIMIT)
+        self.current_file = path
+
+        self.preview.configure(state="normal")
+        self.preview.delete("1.0", "end")
+        self.preview.insert("1.0", content)
+        self.preview.configure(state="disabled")
+
+        try:
+            label = os.path.relpath(path, base_dir())
+        except ValueError:
+            label = path
+        line_count = content.count("\n") + 1
+        self.preview_title.configure(text=f"{label}  ·  {line_count} 行")
+
+    def _watch_preview(self):
+        """定时检查预览文件是否被改动，变了就重载（纯 UI 层，不碰后端）。"""
+        try:
+            if self.current_file and os.path.exists(self.current_file):
+                mtime = os.path.getmtime(self.current_file)
+                if self._preview_mtime and mtime != self._preview_mtime:
+                    self._load_preview(self.current_file)
+        except OSError:
+            pass
+        finally:
+            self.root.after(1500, self._watch_preview)
+
+    # ---- 右栏：对话
+
+    def _build_chat_panel(self, parent):
+        self._panel_header(parent, "对话")
+
+        chat_frame = ttk.Frame(parent, padding=(10, 8, 8, 0))
         chat_frame.pack(fill="both", expand=True)
 
         self.chat = tk.Text(
@@ -453,7 +652,7 @@ class AgentApp:
             bg=SURFACE, fg=FG, insertbackground=FG,
             relief="flat", bd=0, highlightthickness=1,
             highlightbackground=BORDER, highlightcolor=BORDER,
-            padx=16, pady=14, spacing1=4, spacing3=4,
+            padx=14, pady=12, spacing1=4, spacing3=4,
             selectbackground="#3a5a78", selectforeground="#ffffff",
         )
         scroll = ttk.Scrollbar(chat_frame, command=self.chat.yview)
@@ -462,19 +661,18 @@ class AgentApp:
         self.chat.pack(side="left", fill="both", expand=True)
         self.chat.configure(state="disabled")
 
-        # ---- 日志配色（深色背景适配，保持语义：回复浅白 / 工具蓝 / 报错红）
-        self.chat.tag_config("ai", foreground=FG,
-                             font=(UI_FONT, 11))                  # AI 普通回复
+        # ---- 日志配色（语义不变：回复浅白 / 工具蓝 / 报错红 / Diff 红删绿增）
+        self.chat.tag_config("ai", foreground=FG, font=(UI_FONT, 11))
         self.chat.tag_config("tool", foreground="#4cc2ff",
-                             font=(UI_FONT, 11, "bold"))          # 🔧 工具调用
+                             font=(UI_FONT, 11, "bold"))
         self.chat.tag_config("error", foreground="#ff6b6b",
-                             font=(CODE_FONT, 11, "bold"))        # 报错信息
+                             font=(CODE_FONT, 11, "bold"))
         self.chat.tag_config("user", foreground="#7ab8ff",
-                             font=(UI_FONT, 11, "bold"))          # 用户输入
-        self.chat.tag_config("result", foreground=FG_MUTED)       # 工具返回结果
-        self.chat.tag_config("system", foreground="#7a7a7a")      # 系统提示
-        self.chat.tag_config("del", foreground="#ff6b6b")         # Diff：删除行（红）
-        self.chat.tag_config("add", foreground="#6dd47e")         # Diff：新增行（绿）
+                             font=(UI_FONT, 11, "bold"))
+        self.chat.tag_config("result", foreground=FG_MUTED)
+        self.chat.tag_config("system", foreground="#7a7a7a")
+        self.chat.tag_config("del", foreground="#ff6b6b")
+        self.chat.tag_config("add", foreground="#6dd47e")
 
         self._append(
             "你好，我是极简桌面助手。我可以读文件、改文件、跑命令。\n"
@@ -482,44 +680,56 @@ class AgentApp:
             "system",
         )
 
-        # ---- 输入区：加大间距，避免拥挤
-        bottom = ttk.Frame(self.root, padding=(16, 14, 16, 8))
-        bottom.pack(fill="x")
+        # ---- 输入区
+        input_box = ttk.Frame(parent, padding=(10, 10, 8, 6))
+        input_box.pack(fill="x")
 
-        self.entry = ttk.Entry(bottom, font=(UI_FONT, 11))
-        self.entry.pack(side="left", fill="x", expand=True, ipady=7)
+        self.entry = ttk.Entry(input_box, font=(UI_FONT, 11))
+        self.entry.pack(fill="x", ipady=6)
         self.entry.bind("<Return>", lambda _e: self.on_send())
         self.entry.focus_set()
 
+        btn_row = ttk.Frame(parent, padding=(10, 0, 8, 6))
+        btn_row.pack(fill="x")
+
         self.send_btn = ttk.Button(
-            bottom, text="发送", command=self.on_send,
+            btn_row, text="发送", command=self.on_send,
             style="Accent.TButton", width=9,
         )
-        self.send_btn.pack(side="left", padx=(12, 0))
+        self.send_btn.pack(side="left", fill="x", expand=True)
 
-        # 中断按钮：sv-ttk 的样式基于图片，无法直接改红，用 tk.Button 保证红色语义
+        # 中断按钮：sv-ttk 样式基于图片，无法改红，用 tk.Button 保证红色语义
         self.stop_btn = tk.Button(
-            bottom, text="中断", command=self.on_stop,
+            btn_row, text="中断", command=self.on_stop,
             bg=DANGER, fg="white", activebackground="#a02218",
             activeforeground="white", relief="flat", bd=0,
             font=(UI_FONT, 10, "bold"), width=8, cursor="hand2",
             disabledforeground="#7a7a7a", state="disabled",
         )
-        self.stop_btn.pack(side="left", padx=(10, 0), ipady=6)
+        self.stop_btn.pack(side="left", padx=(10, 0), ipady=5)
 
-        # ---- 状态栏：左状态、右清空历史
-        status_bar = ttk.Frame(self.root, padding=(18, 6, 18, 14))
+        # ---- 状态栏
+        status_bar = ttk.Frame(parent, padding=(14, 0, 8, 10))
         status_bar.pack(fill="x")
         self.status = ttk.Label(
-            status_bar, text="就绪", foreground=FG_MUTED,
-            font=(UI_FONT, 9),
+            status_bar, text="就绪", foreground=FG_MUTED, font=(UI_FONT, 9),
         )
         self.status.pack(side="left")
         self.clear_btn = ttk.Button(
-            status_bar, text="清空历史",
-            command=self.on_clear_history, width=10,
+            status_bar, text="清空历史", command=self.on_clear_history, width=10,
         )
         self.clear_btn.pack(side="right")
+
+    def _set_initial_sashes(self):
+        """给三栏一个合理的初始宽度比例（之后用户可自由拖动）。"""
+        try:
+            total = self.paned.winfo_width()
+            if total < 700:
+                return
+            self.paned.sashpos(0, min(240, int(total * 0.2)))
+            self.paned.sashpos(1, int(total * 0.58))
+        except Exception:
+            pass
 
     def _render_history(self):
         """把已保存的历史渲染到界面（system 消息不展示）。"""

@@ -30,9 +30,7 @@ class MCPClient:
     """一个最小可用的 MCP 客户端（stdio 传输）。"""
 
     def __init__(self, server_script=None):
-        self.server_script = server_script or os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), DEFAULT_SERVER
-        )
+        self.server_script = server_script or self._default_server_path()
         self.loop = None
         self.thread = None
         self.session = None
@@ -41,6 +39,21 @@ class MCPClient:
         self._error = None
         self._ready = threading.Event()
         self._shutdown = None     # asyncio.Event，在 _serve 内创建
+
+    @staticmethod
+    def _default_server_path():
+        """定位 mcp_server.py 的真实位置。
+
+        开发时：脚本所在目录，__file__ 可靠。
+        打包后：__file__ 指向 PyInstaller 的临时解压目录 _MEIxxxxxx，
+                该目录随进程退出即被删除，用户也不会把 mcp_server.py 放进去。
+                因此必须改用 exe 所在目录，让脚本与 exe 并排放置。
+        """
+        if getattr(sys, "frozen", False):
+            base = os.path.dirname(sys.executable)      # 打包后：exe 所在目录
+        else:
+            base = os.path.dirname(os.path.abspath(__file__))   # 开发时：脚本目录
+        return os.path.join(base, DEFAULT_SERVER)
 
     # ------------------------------------------------------------ 生命周期
     def start(self, timeout=25.0):
@@ -51,7 +64,11 @@ class MCPClient:
             False 表示失败（原因见 self.error），此时不影响本地工具。
         """
         if not os.path.exists(self.server_script):
-            self._error = f"找不到 Server 脚本: {self.server_script}"
+            hint = (
+                "（打包版请把 mcp_server.py 放到 exe 同级目录）"
+                if getattr(sys, "frozen", False) else ""
+            )
+            self._error = f"找不到 Server 脚本: {self.server_script}{hint}"
             self._ready.set()
             return False
 
