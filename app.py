@@ -12,11 +12,15 @@ import queue
 import sys
 import threading
 import tkinter as tk
-from tkinter import messagebox
-from tkinter.scrolledtext import ScrolledText
+from tkinter import messagebox, ttk
 
 from dotenv import load_dotenv
 from openai import OpenAI
+
+try:                    # 主题库缺失时自动降级为默认样式，不影响任何功能
+    import sv_ttk
+except ImportError:
+    sv_ttk = None
 
 from tools import bash, edit, read, write
 
@@ -58,12 +62,17 @@ HISTORY_FILE = "history.json"   # 会话历史文件名（存于程序同目录�
 MAX_HISTORY = 50       # 历史消息上限，超出时保留 system + 最近 N 条
 MODEL = os.getenv("OPENAI_MODEL", "deepseek-chat")
 
-# 配色
-BG = "#f5f6f8"
-HEADER_BG = "#2c3e50"
-ACCENT = "#3498db"
-DANGER = "#e74c3c"
-TEXT_DARK = "#2c3e50"
+# 配色：Sun Valley 深色（Win11 风格）
+BG = "#1c1c1c"          # 窗口底色
+SURFACE = "#272727"     # 聊天区底色
+BORDER = "#3a3a3a"      # 分割线 / 边框
+FG = "#e8e8e8"          # 主文字（深色背景上用浅色替代黑色）
+FG_MUTED = "#9a9a9a"    # 次要文字
+ACCENT = "#4cc2ff"      # 强调蓝
+DANGER = "#c42b1c"      # 危险红
+
+UI_FONT = "Microsoft YaHei UI"   # 界面字体
+CODE_FONT = "Consolas"           # 聊天区字体（代码较多）
 
 SYSTEM_PROMPT = """你是运行在用户本机上的桌面助手 Agent，可以使用四个工具：
 - read(path, limit)：读取文件内容
@@ -400,56 +409,53 @@ class AgentApp:
     def _build_ui(self):
         self.root.title("极简桌面助手 - AI Agent")
         self._set_icon()
-        self.root.geometry("780x580")
-        self.root.minsize(560, 420)
+        self.root.geometry("840x640")
+        self.root.minsize(620, 480)
         self.root.configure(bg=BG)
 
-        # 标题栏
-        header = tk.Frame(self.root, bg=HEADER_BG, height=54)
+        # ---- 标题栏：用 ttk 容器，背景跟随主题，避免色差断层
+        header = ttk.Frame(self.root, padding=(20, 14, 20, 10))
         header.pack(fill="x")
-        header.pack_propagate(False)
-        tk.Label(
-            header, text="极简桌面助手", fg="white", bg=HEADER_BG,
-            font=("Microsoft YaHei", 15, "bold"),
-        ).pack(side="left", padx=16)
-        tk.Label(
-            header, text=f"模型: {MODEL} ｜ 工具: read/write/edit/bash",
-            fg="#aebac9", bg=HEADER_BG, font=("Microsoft YaHei", 9),
-        ).pack(side="right", padx=16)
+        ttk.Label(
+            header, text="极简桌面助手",
+            font=(UI_FONT, 16, "bold"),
+        ).pack(side="left")
+        ttk.Label(
+            header, text=f"{MODEL}  ｜  read / write / edit / bash",
+            font=(UI_FONT, 9), foreground=FG_MUTED,
+        ).pack(side="right")
 
-        # 聊天记录区
-        chat_frame = tk.Frame(self.root, bg=BG)
-        chat_frame.pack(fill="both", expand=True, padx=12, pady=(10, 6))
+        # ---- 聊天区：ttk 没有 ScrolledText，用 Text + ttk.Scrollbar 组合
+        chat_frame = ttk.Frame(self.root, padding=(16, 2, 16, 0))
+        chat_frame.pack(fill="both", expand=True)
 
-        self.chat = ScrolledText(
-            chat_frame, wrap="word", font=("Consolas", 10),
-            bg="white", fg=TEXT_DARK, relief="solid", bd=1,
-            padx=10, pady=8, spacing1=2, spacing3=2,
+        self.chat = tk.Text(
+            chat_frame, wrap="word", font=(CODE_FONT, 11),
+            bg=SURFACE, fg=FG, insertbackground=FG,
+            relief="flat", bd=0, highlightthickness=1,
+            highlightbackground=BORDER, highlightcolor=BORDER,
+            padx=16, pady=14, spacing1=4, spacing3=4,
+            selectbackground="#3a5a78", selectforeground="#ffffff",
         )
-        self.chat.pack(fill="both", expand=True)
+        scroll = ttk.Scrollbar(chat_frame, command=self.chat.yview)
+        self.chat.configure(yscrollcommand=scroll.set)
+        scroll.pack(side="right", fill="y")
+        self.chat.pack(side="left", fill="both", expand=True)
         self.chat.configure(state="disabled")
 
-        # 日志配色：AI 黑色 / 工具蓝色 / 报错红色
-        self.chat.tag_config(
-            "ai", foreground="#2c3e50",
-            font=("Microsoft YaHei", 10),
-        )                                                    # AI 普通回复
-        self.chat.tag_config(
-            "tool", foreground="#0b84ff",
-            font=("Microsoft YaHei", 10, "bold"),
-        )                                                    # 🔧 工具调用
-        self.chat.tag_config(
-            "error", foreground="#e74c3c",
-            font=("Consolas", 10, "bold"),
-        )                                                    # 报错信息
-        self.chat.tag_config(
-            "user", foreground="#1a73e8",
-            font=("Microsoft YaHei", 10, "bold"),
-        )                                                    # 用户输入
-        self.chat.tag_config("result", foreground="#6b7b8c")  # 工具返回结果
-        self.chat.tag_config("system", foreground="#999999")  # 系统提示
-        self.chat.tag_config("del", foreground="#c0392b")     # Diff：删除行（红）
-        self.chat.tag_config("add", foreground="#1e8449")     # Diff：新增行（绿）
+        # ---- 日志配色（深色背景适配，保持语义：回复浅白 / 工具蓝 / 报错红）
+        self.chat.tag_config("ai", foreground=FG,
+                             font=(UI_FONT, 11))                  # AI 普通回复
+        self.chat.tag_config("tool", foreground="#4cc2ff",
+                             font=(UI_FONT, 11, "bold"))          # 🔧 工具调用
+        self.chat.tag_config("error", foreground="#ff6b6b",
+                             font=(CODE_FONT, 11, "bold"))        # 报错信息
+        self.chat.tag_config("user", foreground="#7ab8ff",
+                             font=(UI_FONT, 11, "bold"))          # 用户输入
+        self.chat.tag_config("result", foreground=FG_MUTED)       # 工具返回结果
+        self.chat.tag_config("system", foreground="#7a7a7a")      # 系统提示
+        self.chat.tag_config("del", foreground="#ff6b6b")         # Diff：删除行（红）
+        self.chat.tag_config("add", foreground="#6dd47e")         # Diff：新增行（绿）
 
         self._append(
             "你好，我是极简桌面助手。我可以读文件、改文件、跑命令。\n"
@@ -457,47 +463,42 @@ class AgentApp:
             "system",
         )
 
-        # 输入区
-        bottom = tk.Frame(self.root, bg=BG)
-        bottom.pack(fill="x", padx=12, pady=(0, 10))
+        # ---- 输入区：加大间距，避免拥挤
+        bottom = ttk.Frame(self.root, padding=(16, 14, 16, 8))
+        bottom.pack(fill="x")
 
-        self.entry = tk.Entry(
-            bottom, font=("Microsoft YaHei", 10), relief="solid", bd=1,
-        )
+        self.entry = ttk.Entry(bottom, font=(UI_FONT, 11))
         self.entry.pack(side="left", fill="x", expand=True, ipady=7)
         self.entry.bind("<Return>", lambda _e: self.on_send())
         self.entry.focus_set()
 
-        self.send_btn = tk.Button(
+        self.send_btn = ttk.Button(
             bottom, text="发送", command=self.on_send,
-            bg=ACCENT, fg="white", activebackground="#2980b9",
-            activeforeground="white", relief="flat",
-            font=("Microsoft YaHei", 10, "bold"), width=8, padx=10,
+            style="Accent.TButton", width=9,
         )
-        self.send_btn.pack(side="left", padx=(8, 0), ipady=5)
+        self.send_btn.pack(side="left", padx=(12, 0))
 
+        # 中断按钮：sv-ttk 的样式基于图片，无法直接改红，用 tk.Button 保证红色语义
         self.stop_btn = tk.Button(
-            bottom, text="■ 中断", command=self.on_stop,
-            bg=DANGER, fg="white", activebackground="#c0392b",
-            activeforeground="white", relief="flat",
-            font=("Microsoft YaHei", 10, "bold"), width=8, padx=10,
-            state="disabled",
+            bottom, text="中断", command=self.on_stop,
+            bg=DANGER, fg="white", activebackground="#a02218",
+            activeforeground="white", relief="flat", bd=0,
+            font=(UI_FONT, 10, "bold"), width=8, cursor="hand2",
+            disabledforeground="#7a7a7a", state="disabled",
         )
-        self.stop_btn.pack(side="left", padx=(8, 0), ipady=5)
+        self.stop_btn.pack(side="left", padx=(10, 0), ipady=6)
 
-        # 状态栏（左：状态文字；右：清空历史按钮）
-        status_bar = tk.Frame(self.root, bg=BG)
-        status_bar.pack(fill="x", padx=14, pady=(0, 10))
-        self.status = tk.Label(
-            status_bar, text="就绪", anchor="w", bg=BG, fg="#7f8c8d",
-            font=("Microsoft YaHei", 9),
+        # ---- 状态栏：左状态、右清空历史
+        status_bar = ttk.Frame(self.root, padding=(18, 6, 18, 14))
+        status_bar.pack(fill="x")
+        self.status = ttk.Label(
+            status_bar, text="就绪", foreground=FG_MUTED,
+            font=(UI_FONT, 9),
         )
         self.status.pack(side="left")
-        self.clear_btn = tk.Button(
-            status_bar, text="清空历史", command=self.on_clear_history,
-            bg="#95a5a6", fg="white", activebackground="#7f8c8d",
-            activeforeground="white", relief="flat",
-            font=("Microsoft YaHei", 9), padx=10,
+        self.clear_btn = ttk.Button(
+            status_bar, text="清空历史",
+            command=self.on_clear_history, width=10,
         )
         self.clear_btn.pack(side="right")
 
@@ -672,6 +673,10 @@ def main():
         )
 
     root = tk.Tk()
+    # Sun Valley 深色主题（Win11 风格）；sv-ttk 未安装时自动降级
+    if sv_ttk is not None:
+        sv_ttk.set_theme("dark", root)
+
     AgentApp(root)
     root.mainloop()
 
