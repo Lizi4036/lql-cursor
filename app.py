@@ -644,11 +644,61 @@ class AgentApp:
     def _build_chat_panel(self, parent):
         self._panel_header(parent, "对话")
 
-        chat_frame = ttk.Frame(parent, padding=(10, 8, 8, 0))
-        chat_frame.pack(fill="both", expand=True)
+        # ---- 底部固定区：必须**先** pack 到 BOTTOM。
+        # 若先 pack 聊天区，Text 的默认请求尺寸（80x24 字符）会先把高度吃光，
+        # 后面这些控件会被挤成 0 高度而看不见。
+        bottom = ttk.Frame(parent)
+        bottom.pack(side=tk.BOTTOM, fill=tk.X)
 
+        # 输入框
+        input_box = ttk.Frame(bottom, padding=(10, 10, 8, 6))
+        input_box.pack(side=tk.TOP, fill=tk.X)
+
+        self.entry = ttk.Entry(input_box, font=(UI_FONT, 11))
+        self.entry.pack(fill="x", ipady=6)
+        self.entry.bind("<Return>", lambda _e: self.on_send())
+        self.entry.focus_set()
+
+        # 发送 / 中断
+        btn_row = ttk.Frame(bottom, padding=(10, 0, 8, 6))
+        btn_row.pack(side=tk.TOP, fill=tk.X)
+
+        self.send_btn = ttk.Button(
+            btn_row, text="发送", command=self.on_send,
+            style="Accent.TButton", width=9,
+        )
+        self.send_btn.pack(side="left", fill="x", expand=True)
+
+        # 中断按钮：sv-ttk 样式基于图片，无法改红，用 tk.Button 保证红色语义
+        self.stop_btn = tk.Button(
+            btn_row, text="中断", command=self.on_stop,
+            bg=DANGER, fg="white", activebackground="#a02218",
+            activeforeground="white", relief="flat", bd=0,
+            font=(UI_FONT, 10, "bold"), width=8, cursor="hand2",
+            disabledforeground="#7a7a7a", state="disabled",
+        )
+        self.stop_btn.pack(side="left", padx=(10, 0), ipady=5)
+
+        # 状态栏：左状态、右清空历史
+        status_bar = ttk.Frame(bottom, padding=(14, 0, 8, 8))
+        status_bar.pack(side=tk.TOP, fill=tk.X)
+        self.status = ttk.Label(
+            status_bar, text="就绪", foreground=FG_MUTED, font=(UI_FONT, 9),
+        )
+        self.status.pack(side="left")
+        self.clear_btn = ttk.Button(
+            status_bar, text="清空历史", command=self.on_clear_history, width=10,
+        )
+        self.clear_btn.pack(side="right")
+
+        # ---- 聊天区：最后 pack，TOP + expand 填满剩余空间
+        chat_frame = ttk.Frame(parent, padding=(10, 8, 8, 0))
+        chat_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
+        # width/height 给小值：默认 80x24 的请求尺寸会反过来挤压底栏
         self.chat = tk.Text(
             chat_frame, wrap="word", font=(CODE_FONT, 11),
+            width=1, height=1,
             bg=SURFACE, fg=FG, insertbackground=FG,
             relief="flat", bd=0, highlightthickness=1,
             highlightbackground=BORDER, highlightcolor=BORDER,
@@ -679,46 +729,6 @@ class AgentApp:
             "直接输入你想让我做的事，按回车或点【发送】开始。",
             "system",
         )
-
-        # ---- 输入区
-        input_box = ttk.Frame(parent, padding=(10, 10, 8, 6))
-        input_box.pack(fill="x")
-
-        self.entry = ttk.Entry(input_box, font=(UI_FONT, 11))
-        self.entry.pack(fill="x", ipady=6)
-        self.entry.bind("<Return>", lambda _e: self.on_send())
-        self.entry.focus_set()
-
-        btn_row = ttk.Frame(parent, padding=(10, 0, 8, 6))
-        btn_row.pack(fill="x")
-
-        self.send_btn = ttk.Button(
-            btn_row, text="发送", command=self.on_send,
-            style="Accent.TButton", width=9,
-        )
-        self.send_btn.pack(side="left", fill="x", expand=True)
-
-        # 中断按钮：sv-ttk 样式基于图片，无法改红，用 tk.Button 保证红色语义
-        self.stop_btn = tk.Button(
-            btn_row, text="中断", command=self.on_stop,
-            bg=DANGER, fg="white", activebackground="#a02218",
-            activeforeground="white", relief="flat", bd=0,
-            font=(UI_FONT, 10, "bold"), width=8, cursor="hand2",
-            disabledforeground="#7a7a7a", state="disabled",
-        )
-        self.stop_btn.pack(side="left", padx=(10, 0), ipady=5)
-
-        # ---- 状态栏
-        status_bar = ttk.Frame(parent, padding=(14, 0, 8, 10))
-        status_bar.pack(fill="x")
-        self.status = ttk.Label(
-            status_bar, text="就绪", foreground=FG_MUTED, font=(UI_FONT, 9),
-        )
-        self.status.pack(side="left")
-        self.clear_btn = ttk.Button(
-            status_bar, text="清空历史", command=self.on_clear_history, width=10,
-        )
-        self.clear_btn.pack(side="right")
 
     def _set_initial_sashes(self):
         """给三栏一个合理的初始宽度比例（之后用户可自由拖动）。"""
