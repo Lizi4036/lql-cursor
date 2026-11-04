@@ -75,6 +75,48 @@ TREE_IGNORE = {".git", "__pycache__", "dist", "build", "node_modules",
                "venv", ".venv", ".idea", ".vscode", ".mypy_cache"}
 MODEL = os.getenv("OPENAI_MODEL", "deepseek-chat")
 
+# ---- 可切换的大模型预设
+# 切换时只改 os.environ 与全局 MODEL：run_agent 每次调用都会重新读取
+# OPENAI_BASE_URL 和 MODEL，因此后端逻辑无需任何改动。
+MODEL_PRESETS = {
+    "DeepSeek": {
+        "model": "deepseek-chat",
+        "base_url": "https://api.deepseek.com",
+        "key_env": "DEEPSEEK_API_KEY",
+    },
+    "Kimi": {
+        "model": "moonshot-v1-8k",
+        "base_url": "https://api.moonshot.cn/v1",
+        "key_env": "MOONSHOT_API_KEY",
+    },
+    "通义千问": {
+        "model": "qwen-plus",
+        "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        "key_env": "DASHSCOPE_API_KEY",
+    },
+}
+
+# ---- 明暗两套配色（ttk 控件由 sv-ttk 负责，这里只管 tk.Text）
+THEME_PALETTE = {
+    "dark": {
+        "bg": "#1c1c1c", "surface": "#272727", "border": "#3a3a3a",
+        "fg": "#e8e8e8", "fg_muted": "#9a9a9a",
+        "select_bg": "#3a5a78", "select_fg": "#ffffff",
+        "ai": "#e8e8e8", "tool": "#4cc2ff", "error": "#ff6b6b",
+        "user": "#7ab8ff", "result": "#9a9a9a", "system": "#7a7a7a",
+        "del": "#ff6b6b", "add": "#6dd47e",
+    },
+    "light": {
+        "bg": "#f3f3f3", "surface": "#ffffff", "border": "#d6d6d6",
+        "fg": "#1a1a1a", "fg_muted": "#6b6b6b",
+        "select_bg": "#cce4f7", "select_fg": "#000000",
+        "ai": "#1a1a1a", "tool": "#0b6fbf", "error": "#c42b1c",
+        "user": "#174ea6", "result": "#5a5a5a", "system": "#767676",
+        "del": "#c42b1c", "add": "#0f7b3f",
+    },
+}
+CURRENT_THEME = "dark"
+
 # 配色：Sun Valley 深色（Win11 风格）
 BG = "#1c1c1c"          # 窗口底色
 SURFACE = "#272727"     # 聊天区底色
@@ -450,10 +492,29 @@ class AgentApp:
         ttk.Label(
             header, text="极简桌面助手", font=(UI_FONT, 15, "bold"),
         ).pack(side="left")
-        ttk.Label(
-            header, text=f"{MODEL}  ｜  read / write / edit / bash + MCP",
+
+        # 最右：明暗主题切换
+        self.theme_btn = ttk.Button(
+            header, text="☀️", width=4, command=self.toggle_theme,
+        )
+        self.theme_btn.pack(side="right", padx=(6, 0))
+
+        # 模型切换下拉框
+        self.model_box = ttk.Combobox(
+            header, values=list(MODEL_PRESETS), state="readonly",
+            width=11, font=(UI_FONT, 9),
+        )
+        self.model_box.set(self._current_model_name())
+        self.model_box.pack(side="right", padx=(10, 0))
+        self.model_box.bind("<<ComboboxSelected>>", self._on_model_change)
+
+        # 当前模型提示
+        self.model_label = ttk.Label(
+            header,
+            text=f"{MODEL}  ｜  read / write / edit / bash + MCP",
             font=(UI_FONT, 9), foreground=FG_MUTED,
-        ).pack(side="right")
+        )
+        self.model_label.pack(side="right")
 
         # ---- 三栏容器：分隔线可拖动，自由调整三栏宽度
         self.paned = ttk.PanedWindow(self.root, orient="horizontal")
@@ -470,8 +531,97 @@ class AgentApp:
         self._build_preview_panel(middle)
         self._build_chat_panel(right)
 
+        # 应用当前主题配色（统一 tk.Text 与日志标签）
+        self._apply_theme_colors()
+
         # 等窗口真正渲染后再设置分隔线初始位置
         self.root.after(150, self._set_initial_sashes)
+
+    # ---- 主题与模型切换（纯界面层）
+
+    def _current_model_name(self):
+        """根据当前 MODEL 反查下拉框应显示的预设名。"""
+        for name, preset in MODEL_PRESETS.items():
+            if preset["model"] == MODEL:
+                return name
+        return next(iter(MODEL_PRESETS))
+
+    def _on_model_change(self, _event=None):
+        """切换大模型：只改环境变量与全局 MODEL。
+
+        run_agent 里每次调用都会重新读 OPENAI_BASE_URL 与 MODEL，
+        因此这里不需要改动任何后端代码。
+        """
+        global MODEL
+        name = self.model_box.get()
+        preset = MODEL_PRESETS.get(name)
+        if not preset:
+            return
+
+        MODEL = preset["model"]
+        os.environ["OPENAI_BASE_URL"] = preset["base_url"]
+
+        # 优先用该平台专用 Key，没有则沿用当前 Key（可能鉴权失败，需提示）
+        dedicated = os.getenv(preset["key_env"])
+        key = dedicated or os.getenv("OPENAI_API_KEY")
+        if key:
+            os.environ["OPENAI_API_KEY"] = key
+
+        if dedicated:
+            self.emit(f"[模型] 已切换到 {name}（{preset['model']}）", "tool")
+        else:
+            self.emit(
+                f"[模型] 已切换到 {name}（{preset['model']}），"
+                f"但未找到 {preset['key_env']}，将沿用现有 Key，"
+                f"鉴权可能失败。请在 .env 中补充 {preset['key_env']}。",
+                "system",
+            )
+
+        self.model_label.configure(
+            text=f"{preset['model']}  ｜  read / write / edit / bash + MCP"
+        )
+        self.status.configure(text=f"当前模型：{preset['model']}")
+
+    def toggle_theme(self):
+        """深色 / 浅色主题切换。"""
+        global CURRENT_THEME
+        CURRENT_THEME = "light" if CURRENT_THEME == "dark" else "dark"
+
+        if sv_ttk is not None:
+            try:
+                sv_ttk.set_theme(CURRENT_THEME, self.root)
+            except Exception:
+                pass
+
+        self._apply_theme_colors()
+        # 深色时显示 ☀️（点了变亮），浅色时显示 🌙
+        self.theme_btn.configure(text="🌙" if CURRENT_THEME == "light" else "☀️")
+        self.status.configure(
+            text=f"已切换到{'浅色' if CURRENT_THEME == 'light' else '深色'}主题"
+        )
+
+    def _apply_theme_colors(self):
+        """把当前主题配色应用到两个 Text 控件与日志标签。
+
+        ttk 控件由 sv-ttk 自动处理，这里只负责 tk.Text 这类原生控件。
+        """
+        c = THEME_PALETTE[CURRENT_THEME]
+        self.root.configure(bg=c["bg"])
+
+        for widget in (self.chat, self.preview):
+            widget.configure(
+                bg=c["surface"], fg=c["fg"], insertbackground=c["fg"],
+                highlightbackground=c["border"], highlightcolor=c["border"],
+                selectbackground=c["select_bg"], selectforeground=c["select_fg"],
+            )
+
+        for tag in ("ai", "tool", "error", "user",
+                    "result", "system", "del", "add"):
+            self.chat.tag_config(tag, foreground=c[tag])
+        self.preview.tag_config("hint", foreground=c["fg_muted"])
+
+        if hasattr(self, "model_label"):
+            self.model_label.configure(foreground=c["fg_muted"])
 
     def _panel_header(self, parent, text):
         """各栏统一的分区标题（标题 + 细分隔线），让整体更像 IDE。"""
