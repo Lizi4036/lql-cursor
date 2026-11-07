@@ -34,15 +34,21 @@ from tools import bash, edit, read, write
 
 # 技能系统（渐进披露）：缺失时优雅降级，主程序照常运行
 try:
-    from skills import USE_SKILL_SCHEMA, catalog_prompt, use_skill
+    from skills import USE_SKILL_SCHEMA, catalog_prompt, load_catalog, use_skill
 except ImportError:
     USE_SKILL_SCHEMA = None
 
     def catalog_prompt():
         return ""
 
+    def load_catalog():
+        return []
+
     def use_skill(name):
         return "[错误] 技能系统未安装"
+
+SKILL_CATALOG = load_catalog()
+SKILL_PLACEHOLDER = "— 技能演示 —"
 
 
 def base_dir():
@@ -108,21 +114,33 @@ MODEL_PRESETS = {
     },
 }
 
-# ---- 明暗两套配色（ttk 控件由 sv-ttk 负责，这里只管 tk.Text）
+# ---- 明暗两套配色（ttk 控件由 sv-ttk 负责，这里只管 tk.Text 与少量样式）
 THEME_PALETTE = {
     "dark": {
         "bg": "#1c1c1c", "surface": "#272727", "border": "#3a3a3a",
+        "header_bg": "#232323",                       # 顶栏底色
+        "preview_bg": "#1f1f1f",                      # 中栏比两侧略深，自然分区
+        "card_bg": "#2d2d2d", "card_border": "#3f3f3f",  # 输入区卡片
+        "user_bg": "#1d3350",                         # 用户消息气泡底色
+        "tree_select": "#2f6fd6",                     # 文件树选中高亮
+        "status_fg": "#6f6f6f",                       # 状态栏文字（更灰）
         "fg": "#e8e8e8", "fg_muted": "#9a9a9a",
         "select_bg": "#3a5a78", "select_fg": "#ffffff",
-        "ai": "#e8e8e8", "tool": "#4cc2ff", "error": "#ff6b6b",
+        "ai": "#e8e8e8", "tool": "#8f8f8f", "error": "#ff6b6b",
         "user": "#7ab8ff", "result": "#9a9a9a", "system": "#7a7a7a",
         "del": "#ff6b6b", "add": "#6dd47e",
     },
     "light": {
         "bg": "#f3f3f3", "surface": "#ffffff", "border": "#d6d6d6",
+        "header_bg": "#eaeaea",
+        "preview_bg": "#f2f2f2",
+        "card_bg": "#ffffff", "card_border": "#c9c9c9",
+        "user_bg": "#dbeafe",
+        "tree_select": "#2f6fd6",
+        "status_fg": "#9a9a9a",
         "fg": "#1a1a1a", "fg_muted": "#6b6b6b",
         "select_bg": "#cce4f7", "select_fg": "#000000",
-        "ai": "#1a1a1a", "tool": "#0b6fbf", "error": "#c42b1c",
+        "ai": "#1a1a1a", "tool": "#767676", "error": "#c42b1c",
         "user": "#174ea6", "result": "#5a5a5a", "system": "#767676",
         "del": "#c42b1c", "add": "#0f7b3f",
     },
@@ -138,8 +156,8 @@ FG_MUTED = "#9a9a9a"    # 次要文字
 ACCENT = "#4cc2ff"      # 强调蓝
 DANGER = "#c42b1c"      # 危险红
 
-UI_FONT = "Microsoft YaHei UI"   # 界面字体
-CODE_FONT = "Consolas"           # 聊天区字体（代码较多）
+UI_FONT = "Microsoft YaHei UI"   # 界面字体（按钮/输入框/文件树/下拉框）
+CODE_FONT = "Microsoft YaHei UI"  # 聊天区与预览（全局统一雅黑，字号见各控件）
 
 SYSTEM_PROMPT = """你是运行在用户本机上的桌面助手 Agent，可以使用四个工具：
 - read(path, limit)：读取文件内容
@@ -506,19 +524,22 @@ class AgentApp:
         self.root.geometry("1200x720")
         self.root.minsize(900, 560)
         self.root.configure(bg=BG)
+        self._apply_window_chrome()
 
-        # ---- 顶部标题栏：横跨三栏
-        header = ttk.Frame(self.root, padding=(18, 12, 18, 6))
+        # ---- 顶部标题栏：带底色，横跨三栏，底部用分隔线与主区域隔开
+        header = ttk.Frame(self.root, style="Header.TFrame",
+                           padding=(20, 12, 20, 10))
         header.pack(fill="x")
         ttk.Label(
-            header, text="极简桌面助手", font=(UI_FONT, 15, "bold"),
+            header, text="极简桌面助手", font=(UI_FONT, 16, "bold"),
+            style="Header.TLabel",
         ).pack(side="left")
 
         # 最右：明暗主题切换
         self.theme_btn = ttk.Button(
             header, text="☀️", width=4, command=self.toggle_theme,
         )
-        self.theme_btn.pack(side="right", padx=(6, 0))
+        self.theme_btn.pack(side="right", padx=(0, 0))
 
         # 模型切换下拉框
         self.model_box = ttk.Combobox(
@@ -526,16 +547,21 @@ class AgentApp:
             width=11, font=(UI_FONT, 9),
         )
         self.model_box.set(self._current_model_name())
-        self.model_box.pack(side="right", padx=(10, 0))
+        self.model_box.pack(side="right", padx=(14, 14))
         self.model_box.bind("<<ComboboxSelected>>", self._on_model_change)
 
-        # 当前模型提示
-        self.model_label = ttk.Label(
+        # 技能演示下拉框：选中即把该技能的演示提示词填入输入框（纯 UI 层）
+        self.skill_box = ttk.Combobox(
             header,
-            text=f"{MODEL}  ｜  read / write / edit / bash + MCP",
-            font=(UI_FONT, 9), foreground=FG_MUTED,
+            values=[SKILL_PLACEHOLDER] + [s["name"] for s in SKILL_CATALOG],
+            state="readonly", width=13, font=(UI_FONT, 9),
         )
-        self.model_label.pack(side="right")
+        self.skill_box.set(SKILL_PLACEHOLDER)
+        self.skill_box.pack(side="right", padx=(14, 0))
+        self.skill_box.bind("<<ComboboxSelected>>", self._on_skill_pick)
+
+        # 顶栏底部阴影线：把标题栏与三栏主区域彻底隔开
+        ttk.Separator(self.root, orient="horizontal").pack(fill="x")
 
         # ---- 三栏容器：分隔线可拖动，自由调整三栏宽度
         self.paned = ttk.PanedWindow(self.root, orient="horizontal")
@@ -598,10 +624,23 @@ class AgentApp:
                 "system",
             )
 
-        self.model_label.configure(
-            text=f"{preset['model']}  ｜  read / write / edit / bash + MCP"
-        )
         self.status.configure(text=f"当前模型：{preset['model']}")
+
+    def _on_skill_pick(self, _event=None):
+        """技能演示：把选中技能的演示提示词填入输入框，并重置下拉框。
+
+        重置是为了下次选择同一个技能时 <<ComboboxSelected>> 仍会触发。
+        """
+        name = self.skill_box.get()
+        demo = next((s["demo_prompt"] for s in SKILL_CATALOG
+                     if s["name"] == name), None)
+        if not demo:
+            return
+        self.entry.delete(0, "end")
+        self.entry.insert(0, demo)
+        self.entry.focus_set()
+        self.skill_box.set(SKILL_PLACEHOLDER)
+        self.status.configure(text=f"已填入技能演示词：{name}")
 
     def toggle_theme(self):
         """深色 / 浅色主题切换。"""
@@ -615,34 +654,93 @@ class AgentApp:
                 pass
 
         self._apply_theme_colors()
+        self._apply_window_chrome()      # 标题栏颜色跟随主题
         # 深色时显示 ☀️（点了变亮），浅色时显示 🌙
         self.theme_btn.configure(text="🌙" if CURRENT_THEME == "light" else "☀️")
         self.status.configure(
             text=f"已切换到{'浅色' if CURRENT_THEME == 'light' else '深色'}主题"
         )
 
+    def _apply_window_chrome(self):
+        """Win11 窗口外观：圆角 + 标题栏颜色跟随主题（纯外观，可安全失败）。
+
+        通过 DwmSetWindowAttribute 设置：
+          - 属性 33（CORNER_PREFERENCE），值 2 = 四角圆角
+          - 属性 20（USE_IMMERSIVE_DARK_MODE），值随主题深/浅切换
+        Windows 10 的 dwmapi 不认识这些属性号，调用只会返回错误码，
+        不会抛异常；try-except 防的是极老系统缺少 dwmapi.dll 的情况。
+        """
+        try:
+            import ctypes
+            # tkinter 顶层窗口的真实句柄是 Tk 内部子窗口的父窗口
+            hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id())
+            if not hwnd:
+                return
+            dwm = ctypes.windll.dwmapi
+            corner = ctypes.c_int(2)                          # DWMWCP_ROUND
+            dwm.DwmSetWindowAttribute(
+                hwnd, 33, ctypes.byref(corner), ctypes.sizeof(corner))
+            dark = ctypes.c_int(1 if CURRENT_THEME == "dark" else 0)
+            dwm.DwmSetWindowAttribute(
+                hwnd, 20, ctypes.byref(dark), ctypes.sizeof(dark))
+        except Exception:
+            pass    # 非 Windows 或缺少 dwmapi：静默跳过，功能不受影响
+
     def _apply_theme_colors(self):
         """把当前主题配色应用到两个 Text 控件与日志标签。
 
-        ttk 控件由 sv-ttk 自动处理，这里只负责 tk.Text 这类原生控件。
+        ttk 控件的颜色由 sv-ttk 处理；字体在这里显式声明为雅黑——
+        sv_ttk.set_theme 会重建样式配置，所以每次应用主题后都要重设。
         """
         c = THEME_PALETTE[CURRENT_THEME]
         self.root.configure(bg=c["bg"])
 
-        for widget in (self.chat, self.preview):
-            widget.configure(
-                bg=c["surface"], fg=c["fg"], insertbackground=c["fg"],
-                highlightbackground=c["border"], highlightcolor=c["border"],
-                selectbackground=c["select_bg"], selectforeground=c["select_fg"],
-            )
+        style = ttk.Style()
+        style.configure(".", font=(UI_FONT, 10))
+        # sv-ttk 给按钮配置了自带命名字体 SunValleyBodyFont，
+        # 会覆盖 "." 的继承，必须显式覆盖这几个样式
+        style.configure("TButton", font=(UI_FONT, 10), padding=(16, 7))
+        style.configure("Accent.TButton", font=(UI_FONT, 10), padding=(16, 7))
+        style.configure("Treeview", font=(UI_FONT, 10), rowheight=26)
+
+        # 顶栏与输入卡片：底色随主题，把三个区域从视觉上分开
+        style.configure("Header.TFrame", background=c["header_bg"])
+        style.configure("Header.TLabel", background=c["header_bg"])
+        style.configure("Card.TFrame", background=c["card_bg"],
+                        borderwidth=1, relief="solid")
+
+        # 文件树选中高亮为蓝色
+        style.map("Treeview",
+                  background=[("selected", c["tree_select"])],
+                  foreground=[("selected", "#ffffff")])
+
+        # 聊天区用 surface；中栏预览略深一档，与两侧自然区分
+        self.chat.configure(
+            bg=c["surface"], fg=c["fg"], insertbackground=c["fg"],
+            highlightbackground=c["border"], highlightcolor=c["border"],
+            selectbackground=c["select_bg"], selectforeground=c["select_fg"],
+        )
+        self.preview.configure(
+            bg=c["preview_bg"], fg=c["fg"], insertbackground=c["fg"],
+            highlightbackground=c["border"], highlightcolor=c["border"],
+            selectbackground=c["select_bg"], selectforeground=c["select_fg"],
+        )
 
         for tag in ("ai", "tool", "error", "user",
                     "result", "system", "del", "add"):
             self.chat.tag_config(tag, foreground=c[tag])
+        # 工具日志：灰色小一号，不喧宾夺主
+        self.chat.tag_config("tool", foreground=c["tool"],
+                             font=(UI_FONT, 10))
+        # 用户消息气泡：粗体【你】+ 高亮底色正文
+        self.chat.tag_config("user_name", foreground=c["user"],
+                             font=(UI_FONT, 11, "bold"))
+        self.chat.tag_config("user_text", foreground=c["fg"],
+                             background=c["user_bg"],
+                             font=(UI_FONT, 11))
         self.preview.tag_config("hint", foreground=c["fg_muted"])
-
-        if hasattr(self, "model_label"):
-            self.model_label.configure(foreground=c["fg_muted"])
+        # 状态栏文字更灰，不喧宾夺主
+        self.status.configure(foreground=c["status_fg"])
 
     def _panel_header(self, parent, text):
         """各栏统一的分区标题（标题 + 细分隔线），让整体更像 IDE。"""
@@ -677,7 +775,8 @@ class AgentApp:
 
         root_dir = base_dir()
         root_node = self.tree.insert(
-            "", "end", text=os.path.basename(root_dir) or root_dir, open=True,
+            "", "end",
+            text="📁 " + (os.path.basename(root_dir) or root_dir), open=True,
         )
         self._tree_paths[root_node] = root_dir
         self._populate_tree(root_node, root_dir)
@@ -709,7 +808,10 @@ class AgentApp:
             elif entry.name in ("Thumbs.db", "desktop.ini"):
                 continue
 
-            node = self.tree.insert(parent, "end", text=entry.name)
+            node = self.tree.insert(
+                parent, "end",
+                text=("📁 " if is_dir else "📄 ") + entry.name,
+            )
             self._tree_paths[node] = entry.path
             self._node_count += 1
             if is_dir:
@@ -821,18 +923,22 @@ class AgentApp:
         bottom = ttk.Frame(parent)
         bottom.pack(side=tk.BOTTOM, fill=tk.X)
 
+        # 输入卡片：输入框与按钮收进同一个带边框底色的容器
+        card = ttk.Frame(bottom, style="Card.TFrame", padding=(12, 10, 12, 10))
+        card.pack(side=tk.TOP, fill=tk.X, padx=10, pady=(6, 2))
+
         # 输入框
-        input_box = ttk.Frame(bottom, padding=(10, 10, 8, 6))
+        input_box = ttk.Frame(card, style="Card.TFrame")
         input_box.pack(side=tk.TOP, fill=tk.X)
 
         self.entry = ttk.Entry(input_box, font=(UI_FONT, 11))
-        self.entry.pack(fill="x", ipady=6)
+        self.entry.pack(fill="x", ipady=12)
         self.entry.bind("<Return>", lambda _e: self.on_send())
         self.entry.focus_set()
 
         # 发送 / 中断
-        btn_row = ttk.Frame(bottom, padding=(10, 0, 8, 6))
-        btn_row.pack(side=tk.TOP, fill=tk.X)
+        btn_row = ttk.Frame(card, style="Card.TFrame")
+        btn_row.pack(side=tk.TOP, fill=tk.X, pady=(9, 0))
 
         self.send_btn = ttk.Button(
             btn_row, text="发送", command=self.on_send,
@@ -992,7 +1098,12 @@ class AgentApp:
         if tag is None:
             tag = self._guess_tag(text)
         self.chat.configure(state="normal")
-        self.chat.insert("end", text + "\n", tag)
+        if tag == "user" and text.startswith("你："):
+            # 用户消息气泡：粗体【你】+ 高亮底色正文
+            self.chat.insert("end", "【你】 ", "user_name")
+            self.chat.insert("end", text[2:].lstrip() + "\n", "user_text")
+        else:
+            self.chat.insert("end", text + "\n", tag)
         self.chat.see("end")
         self.chat.configure(state="disabled")
 

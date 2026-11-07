@@ -1,6 +1,7 @@
 ---
 name: run-tests
 description: 运行项目测试并收集失败详情；附带 collect_failures.py 脚本，可把失败用例整理成 JSON 简报
+demo_prompt: 请使用 run-tests 技能跑一遍测试并收集失败用例
 ---
 
 # 测试执行技能 (run-tests)

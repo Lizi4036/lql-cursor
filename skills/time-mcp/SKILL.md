@@ -1,6 +1,7 @@
 ---
 name: time-mcp
 description: 查询当前时间或任意城市时区时间；必须通过 MCP 工具 get_current_time 获取，禁止凭记忆猜测
+demo_prompt: 请使用 time-mcp 技能查询现在东京几点
 ---
 
 # 时间查询技能 (time-mcp)

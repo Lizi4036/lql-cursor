@@ -93,6 +93,9 @@ def load_catalog():
                 skills.append({
                     "name": meta["name"],
                     "description": meta["description"],
+                    # 界面演示用：无此字段时给一个通用模板
+                    "demo_prompt": meta.get("demo_prompt")
+                    or f"请使用 {meta['name']} 技能完成任务",
                     "path": skill_md,
                 })
     return skills

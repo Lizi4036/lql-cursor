@@ -1,6 +1,7 @@
 ---
 name: review-diff
 description: 审查代码改动：检查危险操作、安全隐患、错误处理与边界条件，输出结构化审查意见
+demo_prompt: 请使用 review-diff 技能审查 app.py 的代码质量
 ---
 
 # 代码审查技能 (review-diff)
