@@ -32,6 +32,18 @@ MCP_CLIENT = None
 
 from tools import bash, edit, read, write
 
+# 技能系统（渐进披露）：缺失时优雅降级，主程序照常运行
+try:
+    from skills import USE_SKILL_SCHEMA, catalog_prompt, use_skill
+except ImportError:
+    USE_SKILL_SCHEMA = None
+
+    def catalog_prompt():
+        return ""
+
+    def use_skill(name):
+        return "[错误] 技能系统未安装"
+
 
 def base_dir():
     """返回 .env 应该所在的目录。
@@ -141,6 +153,10 @@ SYSTEM_PROMPT = """你是运行在用户本机上的桌面助手 Agent，可以�
 3. 工具结果会反馈给你，据此决定下一步。
 4. 最多 5 步内完成任务；做不到就说明原因，不要编造结果。"""
 
+# 技能目录（渐进披露）：启动时只注入各技能的 name / description 一行摘要，
+# SKILL.md 全文要等模型调用 use_skill 时才读取。
+SYSTEM_PROMPT += catalog_prompt()
+
 # ---------------------------------------------------------------- 工具 Schema
 
 TOOLS = [
@@ -214,6 +230,11 @@ TOOLS = [
 ]
 
 TOOL_MAP = {"read": read, "write": write, "edit": edit, "bash": bash}
+
+# 技能工具：作为第 5 个本地工具注册，execute_tool 的分发逻辑无需任何改动
+if USE_SKILL_SCHEMA is not None:
+    TOOLS.append(USE_SKILL_SCHEMA)
+    TOOL_MAP["use_skill"] = use_skill
 
 
 # ---------------------------------------------------------------- 工具执行

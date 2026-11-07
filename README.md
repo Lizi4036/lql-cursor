@@ -100,6 +100,27 @@ py -m pip install mcp -i https://pypi.tuna.tsinghua.edu.cn/simple
 > 注：打包成 exe 后，MCP 需要目标机器装有 Python 与 mcp 库，
 > 并把 `mcp_server.py` 放在 exe 同级目录；否则自动降级为纯本地模式。
 
+### 6. 技能系统（渐进披露）
+
+给 Agent 加"使用说明书"而不膨胀上下文：每个技能是一个文件夹 +
+一个 `SKILL.md`（头部 front-matter 写 name / description）。
+
+```
+skills/
+├── review-diff/SKILL.md              审查代码改动（纯提示词）
+├── run-tests/SKILL.md                跑测试并收集失败
+│   └── scripts/collect_failures.py   附带脚本：pytest 失败 → JSON 简报
+└── time-mcp/SKILL.md                 查时间（强制走 MCP 工具）
+```
+
+- **启动时**：只读各技能的 name / description，生成目录注入 System Prompt，
+  常驻成本仅 **162 token**
+- **运行时**：模型判断任务相关才调用 `use_skill(skill_name)` 读取全文；
+  三个技能全文共 1173 token，披露比率 **7.24**（省约 86% 常驻开销）
+- **可插拔**：往 `skills/` 放一个新文件夹就是一个新技能，主程序零改动
+- **真实试验**：6 句话触发测试 6/6 通过（详见 `skill_report.json`），
+  复现命令 `py inspect_skills.py`
+
 ---
 
 ## 三、三步启动

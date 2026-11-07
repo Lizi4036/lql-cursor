@@ -1,0 +1,87 @@
+{
+  "generated_at": "2026-11-07T11:48:17",
+  "skills": [
+    {
+      "name": "review-diff",
+      "description": "审查代码改动：检查危险操作、安全隐患、错误处理与边界条件，输出结构化审查意见",
+      "full_md_tokens": 489
+    },
+    {
+      "name": "run-tests",
+      "description": "运行项目测试并收集失败详情；附带 collect_failures.py 脚本，可把失败用例整理成 JSON 简报",
+      "full_md_tokens": 401
+    },
+    {
+      "name": "time-mcp",
+      "description": "查询当前时间或任意城市时区时间；必须通过 MCP 工具 get_current_time 获取，禁止凭记忆猜测",
+      "full_md_tokens": 283
+    }
+  ],
+  "catalog_tokens": 162,
+  "full_tokens": 1173,
+  "disclosure_ratio": 7.24,
+  "trial_mode": "live-api",
+  "trials": [
+    {
+      "phrase": "帮我审查一下刚才对 app.py 的修改有没有问题",
+      "expected_skill": "review-diff",
+      "tool_calls": [
+        "use_skill",
+        "bash"
+      ],
+      "triggered_use_skill": true,
+      "loaded_skill": "review-diff"
+    },
+    {
+      "phrase": "跑一遍测试，把失败用例收集起来给我",
+      "expected_skill": "run-tests",
+      "tool_calls": [
+        "use_skill"
+      ],
+      "triggered_use_skill": true,
+      "loaded_skill": "run-tests"
+    },
+    {
+      "phrase": "现在东京几点了？",
+      "expected_skill": "time-mcp",
+      "tool_calls": [
+        "use_skill"
+      ],
+      "triggered_use_skill": true,
+      "loaded_skill": "time-mcp"
+    },
+    {
+      "phrase": "把 README 第一段里的「桌面」改成「助手」",
+      "expected_skill": null,
+      "tool_calls": [
+        "read"
+      ],
+      "triggered_use_skill": false,
+      "loaded_skill": null
+    },
+    {
+      "phrase": "读一下 requirements.txt 的前 20 行",
+      "expected_skill": null,
+      "tool_calls": [
+        "read"
+      ],
+      "triggered_use_skill": false,
+      "loaded_skill": null
+    },
+    {
+      "phrase": "看看 C 盘还剩多少空间",
+      "expected_skill": null,
+      "tool_calls": [
+        "bash"
+      ],
+      "triggered_use_skill": false,
+      "loaded_skill": null
+    }
+  ],
+  "trial_summary": {
+    "should_trigger": 3,
+    "correctly_triggered": 3,
+    "should_ignore": 3,
+    "correctly_ignored": 3
+  }
+}

@@ -62,6 +62,7 @@
 | F7 | 随时中断 Agent 执行 | ✅ `threading.Event` + 红色按钮 |
 | F8 | 从 `.env` 读取配置 | ✅ `python-dotenv` |
 | F9 | 通过 MCP 动态扩展外部工具 | ✅ MCP Client + `mcp_server.py`（+2 工具） |
+| F10 | 技能系统：按需加载（渐进披露） | ✅ `skills.py` + 3 个技能，触发试验 6/6 |
 
 ### 2.2 非功能性需求
 
@@ -548,6 +549,102 @@ for name in ("python", "python3", "py"):
 找不到就返回 None，MCP 自动降级。这也意味着**打包版的 MCP 需要目标机器
 装有 Python 与 mcp 库**，并把 `mcp_server.py` 放在 exe 同级目录。
 
+### 4.8 技能系统：用渐进披露解决"能力越多，提示词越胖"
+
+#### （1）问题：工具还没堆起来，System Prompt 先爆了
+
+给 Agent 加能力有两种路子：一是硬编码进主程序（四个本地工具的做法），
+二是写一大段使用说明塞进 System Prompt。第二种的问题很直接——
+**说明文字每一轮对话都要随请求发送**，能力越多，每轮的固定开销越大，
+而且大部分内容在某次对话里根本用不到。
+
+技能系统（借鉴 Claude Code 的 Skill 机制）把"说明书"从上下文里拆出来：
+
+```
+skills/
+├── review-diff/SKILL.md              ← 纯提示词技能：审查流程与检查清单
+├── run-tests/
+│   ├── SKILL.md                      ← 指引：先跑 pytest，失败再调脚本
+│   └── scripts/collect_failures.py   ← 附带脚本：解析 pytest 输出为 JSON 简报
+└── time-mcp/SKILL.md                 ← MCP 技能：强制调用 get_current_time，禁止猜时间
+```
+
+每个 SKILL.md 头部用 front-matter 声明元信息：
+
+```markdown
+---
+name: review-diff
+description: 审查代码改动：检查危险操作、安全隐患、错误处理与边界条件
+---
+（正文：完整指引，按需加载）
+```
+
+#### （2）渐进披露：目录常驻，全文按需
+
+**启动时**只解析 front-matter（不读正文），生成一份目录注入 System Prompt：
+
+```
+可用技能（按需加载）：执行相关任务前，先调用 use_skill(skill_name)
+读取完整指引，再按指引操作，不要凭记忆执行：
+- review-diff：审查代码改动：检查危险操作、安全隐患、错误处理与边界条件
+- run-tests：运行项目测试并收集失败详情；附带 collect_failures.py 脚本…
+- time-mcp：查询当前时间或任意城市时区时间；必须通过 MCP 工具获取…
+```
+
+**运行时**新增第 5 个本地工具 `use_skill(skill_name)`，模型判断任务与某技能
+相关时才调用它，此时才把 SKILL.md 全文作为工具结果返回给模型。
+
+两个阶段消耗的 token（CJK 约 1:1、ASCII 约 4:1 估算）：
+
+| 指标 | 值 | 说明 |
+|:---|---:|:---|
+| catalog_tokens | **162** | 目录常驻成本（每轮都花） |
+| full_tokens | **1173** | 三个技能全文总量（若全塞进提示词每轮都花） |
+| disclosure_ratio | **7.24** | 全文 / 目录，按需加载节省约 86% 常驻开销 |
+
+#### （3）接入：四处改动，分发逻辑零修改
+
+`execute_tool` 的约定是"本地 `TOOL_MAP` 优先，查不到再转 MCP"，
+`use_skill` 直接注册进去就完成了接入，一行分发代码都不用动：
+
+```python
+# ① 导入（缺失时优雅降级）
+try:
+    from skills import USE_SKILL_SCHEMA, catalog_prompt, use_skill
+except ImportError:
+    USE_SKILL_SCHEMA = None
+
+# ② 技能目录注入 System Prompt
+SYSTEM_PROMPT += catalog_prompt()
+
+# ③④ 注册为第 5 个本地工具
+if USE_SKILL_SCHEMA is not None:
+    TOOLS.append(USE_SKILL_SCHEMA)
+    TOOL_MAP["use_skill"] = use_skill
+```
+
+容错设计：未知技能名返回 `[错误] 未知技能: xxx。可用技能: …`（字符串，
+不抛异常），与整条工具链的容错约定一致；`skills/` 目录缺失时
+`catalog_prompt()` 返回空串，系统退化为无技能状态照常运行。
+
+#### （4）验证：6 句话真实模型触发试验
+
+用 `inspect_skills.py` 以真实 API 做触发试验（每句 1 次请求，
+观察模型是否调用 `use_skill`、参数是否指向正确技能）：
+
+| 测试话 | 模型行为 | 判定 |
+|:---|:---|:---:|
+| 帮我审查一下刚才对 app.py 的修改有没有问题 | `use_skill(review-diff)` | ✅ |
+| 跑一遍测试，把失败用例收集起来给我 | `use_skill(run-tests)` | ✅ |
+| 现在东京几点了？ | `use_skill(time-mcp)` | ✅ |
+| 把 README 里的「桌面」改成「助手」 | 直接 `read`（先读后改） | ✅ 未误触发 |
+| 读一下 requirements.txt 的前 20 行 | 直接 `read` | ✅ |
+| 看看 C 盘还剩多少空间 | 直接 `bash` | ✅ |
+
+**触发 3/3、正确忽略 3/3**。值得注意的是第四句：模型没有直接 `edit`，
+而是先 `read` 再改——这是合理的 Agent 行为，同时证明技能目录的存在
+不会诱使模型对普通任务乱触发 `use_skill`。
+
 ---
 
 ## 五、测试验证
@@ -630,6 +727,35 @@ for name in ("python", "python3", "py"):
 | 降级保护 | Server 脚本缺失时 `start()` 返回 False，主程序照常可用 | ✅ |
 | 原有功能回归 | 4 个本地工具 / 中断 / 清空历史 / Diff 全部正常 | ✅ |
 | 关闭清理 | 关窗后 MCP 子进程不残留 | ✅ |
+
+### 5.5 技能系统专项测试
+
+**统计报告**（`py inspect_skills.py` 生成 `skill_report.json`）：
+
+| 指标 | 值 |
+|:---|---:|
+| catalog_tokens（目录常驻） | 162 |
+| full_tokens（三个技能全文） | 1173 |
+| disclosure_ratio（全文 / 目录） | 7.24 |
+| 试验模式 | live-api（真实调用 DeepSeek） |
+
+**触发试验**（6 句话，每句 1 次请求）：应触发的 3 句全部正确调用
+`use_skill` 且技能名无误；不应触发的 3 句全部直接使用基础工具
+（read / bash），无误触发。**6/6 通过**。
+
+**工程验证**（19 项回归）：
+
+| 用例 | 结果 |
+|:---|:---:|
+| 三个技能被发现、目录含全部 name/description | ✅ |
+| `use_skill` 读到全文、未知技能返回错误并列出可用项 | ✅ |
+| `TOOLS` 由 4 个扩展为 5 个，前 4 个 schema 逐项原样 | ✅ |
+| `SYSTEM_PROMPT` 注入目录且原有规则未丢失 | ✅ |
+| `execute_tool("use_skill")` 走本地分发成功、错误路径不抛异常 | ✅ |
+| `collect_failures.py` 对故意失败的用例输出正确 JSON 简报、退出码 1 | ✅ |
+| `save/load_history` 回归通过 | ✅ |
+| GUI 冒烟：三栏控件齐全、输入框可见、关窗干净 | ✅ |
+| `skills/` 缺失时降级运行 | ✅ |
 
 ---
 
@@ -749,6 +875,8 @@ load_dotenv(os.path.join(base_dir(), ".env"))
 - 实现 tkinter 图形界面，多线程不卡死，支持一键中断
 - 建立三层安全机制：密钥不入库、配置文件不可读、危险命令不执行
 - 接入 MCP 协议，实现工具的动态发现与跨进程调用，工具数由 4 个扩展到 6 个
+- 实现技能系统（渐进披露）：技能目录常驻仅 162 token，全文按需加载，
+  披露比率 7.24，真实模型触发试验 6/6 通过
 - 编写 25 项单元测试并全部通过
 - 支持 PyInstaller 打包为单文件 exe 分发
 
