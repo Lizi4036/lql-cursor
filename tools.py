@@ -67,15 +67,16 @@ def _decode(raw):
     return raw.decode("utf-8", errors="replace")
 
 
-def read(path, limit=DEFAULT_LIMIT):
+def read(path, limit=DEFAULT_LIMIT, offset=0):
     """读取文件内容。
 
-    超过 limit 个字符时截断，并在末尾附上截断提示，
-    避免超长文件一次性塞满上下文。
+    超过 limit 个字符时截断，并在末尾附上明确的续读提示
+    （告诉模型用 offset 参数继续读），避免模型因看不到完整内容而放弃。
 
     Args:
         path: 文件路径
-        limit: 最大读取字符数，默认 2000
+        limit: 单次最大读取字符数，默认 2000
+        offset: 起始字符偏移（用于分段续读），默认 0
 
     Returns:
         文件内容字符串；出错时返回错误说明。
@@ -95,11 +96,22 @@ def read(path, limit=DEFAULT_LIMIT):
     except OSError as e:
         return f"[错误] 读取失败: {path} -> {e}"
 
+    # offset 续读：先切掉前 offset 个字符
+    if offset > 0:
+        if offset >= len(content):
+            return (f"[提示] offset={offset} 已超出文件长度"
+                    f"（共 {len(content)} 字符），无更多内容。")
+        content = content[offset:]
+
     if len(content) > limit:
         shown = content[:limit]
+        next_offset = offset + limit
+        total = offset + len(content)
         tip = (
-            f"\n\n...[已截断] 文件共 {len(content)} 字符，"
-            f"仅显示前 {limit} 字符。调大 limit 可读取更多。"
+            f"\n\n[注意：该文件内容过长已被截断。原文件共 {total} 字符，"
+            f"本次显示第 {offset}~{next_offset} 字符。"
+            f"若需查看完整内容，请使用 read 工具的 offset 参数继续读取，"
+            f"例如 read(path, offset={next_offset})。]"
         )
         return shown + tip
 
@@ -236,8 +248,10 @@ def bash(command, timeout=30):
     if len(output) > MAX_OUTPUT:
         output = (
             output[:MAX_OUTPUT]
-            + f"\n\n...[已截断] 输出共 {len(output)} 字符，"
-            f"仅显示前 {MAX_OUTPUT} 字符。"
+            + f"\n\n[注意：命令输出过长已被截断（共 {len(output)} 字符，"
+            f"仅显示前 {MAX_OUTPUT} 字符）。"
+            f"如需查看其余部分，请在命令中用 head / tail / findstr 等"
+            f"缩小输出范围后重新执行。]"
         )
 
     return output

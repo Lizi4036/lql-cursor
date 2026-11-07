@@ -124,6 +124,7 @@ THEME_PALETTE = {
         "user_bg": "#1d3350",                         # 用户消息气泡底色
         "tree_select": "#2f6fd6",                     # 文件树选中高亮
         "status_fg": "#6f6f6f",                       # 状态栏文字（更灰）
+        "console_bg": "#151515",                      # 终端区（比聊天区更暗）
         "fg": "#e8e8e8", "fg_muted": "#9a9a9a",
         "select_bg": "#3a5a78", "select_fg": "#ffffff",
         "ai": "#e8e8e8", "tool": "#8f8f8f", "error": "#ff6b6b",
@@ -138,6 +139,7 @@ THEME_PALETTE = {
         "user_bg": "#dbeafe",
         "tree_select": "#2f6fd6",
         "status_fg": "#9a9a9a",
+        "console_bg": "#eaeaea",
         "fg": "#1a1a1a", "fg_muted": "#6b6b6b",
         "select_bg": "#cce4f7", "select_fg": "#000000",
         "ai": "#1a1a1a", "tool": "#767676", "error": "#c42b1c",
@@ -158,6 +160,11 @@ DANGER = "#c42b1c"      # 危险红
 
 UI_FONT = "Microsoft YaHei UI"   # 界面字体（按钮/输入框/文件树/下拉框）
 CODE_FONT = "Microsoft YaHei UI"  # 聊天区与预览（全局统一雅黑，字号见各控件）
+MONO_FONT = "Consolas"           # 终端区等宽字体（工具日志像真实控制台）
+
+# 这些 tag 的内容进上半区"终端"（工具调用/系统信息/报错/结果/Diff），
+# 其余（ai / user）进下半区"对话"——分流点在 _append，队列与 emit 零改动
+CONSOLE_TAGS = ("tool", "error", "result", "system", "del", "add")
 
 SYSTEM_PROMPT = """你是运行在用户本机上的桌面助手 Agent，可以使用四个工具：
 - read(path, limit)：读取文件内容
@@ -166,10 +173,13 @@ SYSTEM_PROMPT = """你是运行在用户本机上的桌面助手 Agent，可以�
 - bash(command, timeout)：执行终端命令
 
 规则：
-1. 修改已有文件时**必须**用 edit 精确替换，禁止用 write 整文件覆盖。
-2. 只有新建文件、或确实需要整体重写时才用 write。
-3. 工具结果会反馈给你，据此决定下一步。
-4. 最多 5 步内完成任务；做不到就说明原因，不要编造结果。"""
+1. 主动性（最重要）：除非用户完全没有提供要操作的代码或文件路径，
+   否则直接调用工具执行任务，不要向用户反问。如果需要获取上下文，
+   请使用工具自己去查（read / bash），而不是问用户。
+2. 修改已有文件时**必须**用 edit 精确替换，禁止用 write 整文件覆盖。
+3. 只有新建文件、或确实需要整体重写时才用 write。
+4. 工具结果会反馈给你，据此决定下一步。
+5. 最多 5 步内完成任务；做不到就说明原因，不要编造结果。"""
 
 # 技能目录（渐进披露）：启动时只注入各技能的 name / description 一行摘要，
 # SKILL.md 全文要等模型调用 use_skill 时才读取。
@@ -182,14 +192,18 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "read",
-            "description": "读取文件内容，超过长度会自动截断。.env 相关文件会被拒绝读取。",
+            "description": "读取文件内容，超过长度会自动截断（截断时会提示用 offset 续读）。.env 相关文件会被拒绝读取。",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "要读取的文件路径"},
                     "limit": {
                         "type": "integer",
-                        "description": "最大读取字符数，默认 2000",
+                        "description": "单次最大读取字符数，默认 2000",
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "description": "起始字符偏移，用于分段续读超长文件，默认 0（从头读）",
                     },
                 },
                 "required": ["path"],
@@ -714,9 +728,14 @@ class AgentApp:
                   background=[("selected", c["tree_select"])],
                   foreground=[("selected", "#ffffff")])
 
-        # 聊天区用 surface；中栏预览略深一档，与两侧自然区分
+        # 聊天区用 surface；终端区更暗一档；中栏预览也独立一档
         self.chat.configure(
             bg=c["surface"], fg=c["fg"], insertbackground=c["fg"],
+            highlightbackground=c["border"], highlightcolor=c["border"],
+            selectbackground=c["select_bg"], selectforeground=c["select_fg"],
+        )
+        self.console.configure(
+            bg=c["console_bg"], fg=c["fg"], insertbackground=c["fg"],
             highlightbackground=c["border"], highlightcolor=c["border"],
             selectbackground=c["select_bg"], selectforeground=c["select_fg"],
         )
@@ -738,6 +757,12 @@ class AgentApp:
         self.chat.tag_config("user_text", foreground=c["fg"],
                              background=c["user_bg"],
                              font=(UI_FONT, 11))
+        # 终端区 tag 跟随主题（等宽字体）
+        for tag in ("tool", "error", "result", "system", "del", "add"):
+            self.console.tag_config(tag, foreground=c[tag],
+                                    font=(MONO_FONT, 10))
+        self.console.tag_config("error", foreground=c["error"],
+                                font=(MONO_FONT, 10, "bold"))
         self.preview.tag_config("hint", foreground=c["fg_muted"])
         # 状态栏文字更灰，不喧宾夺主
         self.status.configure(foreground=c["status_fg"])
@@ -968,9 +993,45 @@ class AgentApp:
         )
         self.clear_btn.pack(side="right")
 
-        # ---- 聊天区：最后 pack，TOP + expand 填满剩余空间
-        chat_frame = ttk.Frame(parent, padding=(10, 8, 8, 0))
-        chat_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        # ---- 右侧主区：垂直 PanedWindow 拆为 终端(上) + 对话(下)
+        # 分隔线可拖动；仍遵守"先 pack bottom、主区最后"的布局红线
+        chat_pane = ttk.PanedWindow(parent, orient="vertical")
+        chat_pane.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        self.chat_pane = chat_pane
+
+        # 上半区：终端 / 思考过程（等宽字体、更暗背景）
+        console_frame = ttk.Frame(chat_pane, padding=(10, 8, 8, 0))
+        chat_pane.add(console_frame, weight=1)
+        self.console = tk.Text(
+            console_frame, wrap="char", font=(MONO_FONT, 10),
+            width=1, height=1,
+            bg=SURFACE, fg=FG, insertbackground=FG,
+            relief="flat", bd=0, highlightthickness=1,
+            highlightbackground=BORDER, highlightcolor=BORDER,
+            padx=12, pady=10, spacing1=2, spacing3=2,
+            selectbackground="#3a5a78", selectforeground="#ffffff",
+        )
+        cscroll = ttk.Scrollbar(console_frame, command=self.console.yview)
+        self.console.configure(yscrollcommand=cscroll.set)
+        cscroll.pack(side="right", fill="y")
+        self.console.pack(side="left", fill="both", expand=True)
+        self.console.configure(state="disabled")
+        self.console.tag_config("tool", foreground="#8f8f8f",
+                                font=(MONO_FONT, 10))
+        self.console.tag_config("error", foreground="#ff6b6b",
+                                font=(MONO_FONT, 10, "bold"))
+        self.console.tag_config("result", foreground=FG_MUTED,
+                                font=(MONO_FONT, 10))
+        self.console.tag_config("system", foreground="#7a7a7a",
+                                font=(MONO_FONT, 10))
+        self.console.tag_config("del", foreground="#ff6b6b",
+                                font=(MONO_FONT, 10))
+        self.console.tag_config("add", foreground="#6dd47e",
+                                font=(MONO_FONT, 10))
+
+        # 下半区：对话（用户蓝气泡 + AI 回复）
+        chat_frame = ttk.Frame(chat_pane, padding=(10, 4, 8, 0))
+        chat_pane.add(chat_frame, weight=2)
 
         # width/height 给小值：默认 80x24 的请求尺寸会反过来挤压底栏
         self.chat = tk.Text(
@@ -1003,12 +1064,13 @@ class AgentApp:
 
         self._append(
             "你好，我是极简桌面助手。我可以读文件、改文件、跑命令。\n"
-            "直接输入你想让我做的事，按回车或点【发送】开始。",
-            "system",
+            "直接输入你想让我做的事，按回车或点【发送】开始。\n"
+            "（上方的终端面板会实时显示工具调用过程。）",
+            "ai",
         )
 
     def _set_initial_sashes(self):
-        """给三栏一个合理的初始宽度比例（之后用户可自由拖动）。"""
+        """给三栏与右栏上下分区一个合理的初始比例（之后用户可自由拖动）。"""
         try:
             total = self.paned.winfo_width()
             if total < 700:
@@ -1017,14 +1079,29 @@ class AgentApp:
             self.paned.sashpos(1, int(total * 0.58))
         except Exception:
             pass
+        try:
+            # 注意用 chat_pane 自身高度：它是去掉顶栏/底栏后的剩余高度，
+            # 若用根窗口高度会算出过大的 sash 位置，把对话区压扁
+            h = self.chat_pane.winfo_height()
+            if h > 200:
+                # 右栏上下分隔：终端约 38%，对话约 62%
+                self.chat_pane.sashpos(0, int(h * 0.38))
+        except Exception:
+            pass
 
     def _render_history(self):
-        """把已保存的历史渲染到界面（system 消息不展示）。"""
+        """把已保存的历史渲染到界面（system 消息不展示）。
+
+        顺序保证：messages 数组本身就是追加式的时间序，
+        按下标顺序渲染即严格按发生时间排列；工具调用额外带序号，
+        加载历史时步数一目了然。
+        """
         shown = [m for m in self.messages if m.get("role") != "system"]
         if not shown:
             return
 
         self._append(f"—— 已加载 {len(shown)} 条历史记录 ——", "system")
+        step = 0
         for m in shown:
             role = m["role"]
             content = m.get("content") or ""
@@ -1034,8 +1111,9 @@ class AgentApp:
                 if content:
                     self._append(content, "ai")
                 for call in m.get("tool_calls") or []:
+                    step += 1
                     fn = (call.get("function") or {}).get("name", "?")
-                    self._append(f"🔧 正在调用工具：{fn}", "tool")
+                    self._append(f"🔧 第 {step} 次调用工具：{fn}", "tool")
             elif role == "tool":
                 self._append(f"   结果: {preview(content)}", "result")
         self._append("—— 以上为历史记录 ——", "system")
@@ -1097,15 +1175,18 @@ class AgentApp:
     def _append(self, text, tag=None):
         if tag is None:
             tag = self._guess_tag(text)
-        self.chat.configure(state="normal")
+        # 数据分流：工具/系统/报错/结果/Diff → 上半区终端；对话 → 下半区聊天。
+        # 分流只发生在显示层，emit / 消息队列 / _poll_queue 一行未动。
+        target = self.console if tag in CONSOLE_TAGS else self.chat
+        target.configure(state="normal")
         if tag == "user" and text.startswith("你："):
             # 用户消息气泡：粗体【你】+ 高亮底色正文
-            self.chat.insert("end", "【你】 ", "user_name")
-            self.chat.insert("end", text[2:].lstrip() + "\n", "user_text")
+            target.insert("end", "【你】 ", "user_name")
+            target.insert("end", text[2:].lstrip() + "\n", "user_text")
         else:
-            self.chat.insert("end", text + "\n", tag)
-        self.chat.see("end")
-        self.chat.configure(state="disabled")
+            target.insert("end", text + "\n", tag)
+        target.see("end")
+        target.configure(state="disabled")
 
     @staticmethod
     def _guess_tag(text):
@@ -1197,10 +1278,11 @@ class AgentApp:
         except OSError as e:
             self._append(f"[警告] 删除 history.json 失败: {e}", "system")
             return
-        # 3) 清空聊天框显示
-        self.chat.configure(state="normal")
-        self.chat.delete("1.0", "end")
-        self.chat.configure(state="disabled")
+        # 3) 清空两个显示区
+        for box in (self.chat, self.console):
+            box.configure(state="normal")
+            box.delete("1.0", "end")
+            box.configure(state="disabled")
 
         self._append("历史已清空。有什么新任务，随时告诉我。", "system")
         self.status.configure(text="已清空历史")
@@ -1211,19 +1293,17 @@ class AgentApp:
         except Exception as e:  # 兜底，保证界面一定能恢复
             self.emit(f"[严重错误] {type(e).__name__}: {e}")
         finally:
-            # 无论正常结束、被中断还是异常，都把会话落盘
-            ok = save_history(self.messages)
-            self.emit(
-                "[系统] 会话已保存到 history.json"
-                if ok
-                else "[警告] 会话保存失败"
-            )
+            # 无论正常结束、被中断还是异常，都把会话落盘。
+            # 保存结果不再刷日志区（琐碎且干扰阅读），由 _on_finished 显示在状态栏
+            self._save_ok = save_history(self.messages)
             self.msg_queue.put("__DONE__")
 
     def _on_finished(self):
         self.send_btn.configure(state="normal")
         self.stop_btn.configure(state="disabled")
-        self.status.configure(text="就绪")
+        # 保存状态只在状态栏提示，不再往日志区堆"[系统] 会话已保存..."
+        ok = getattr(self, "_save_ok", True)
+        self.status.configure(text="会话已保存" if ok else "⚠ 会话保存失败！")
 
 
 # ---------------------------------------------------------------- 入口
